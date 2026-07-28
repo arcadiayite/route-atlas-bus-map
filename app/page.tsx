@@ -8,6 +8,7 @@ type Coord = [number, number];
 type BaseKey = "paper" | "atlas" | "dark" | "satellite";
 type RouteStatus = "searching" | "ready" | "error";
 type CustomNode = { id: string; kind: "stop" | "via"; value: string };
+type DrivingPreference = "fastest" | "avoidCongestion" | "avoidHighway" | "highwayFirst" | "avoidTolls";
 
 type TransitRoute = {
   id: string;
@@ -28,6 +29,7 @@ type TransitRoute = {
 type CropRect = { x: number; y: number; width: number; height: number };
 type ExportFormat = "png" | "svg";
 type MapCamera = { center: Coord; zoom: number; bearing: number; pitch: number };
+type NormalizedPoint = { x: number; y: number };
 type ArchivePayload = {
   version: 1;
   savedAt: number;
@@ -36,11 +38,15 @@ type ArchivePayload = {
   base: BaseKey;
   labels: boolean;
   showStops: boolean;
+  showCasing?: boolean;
   stopMode: "all" | "terminals";
   stopEditing: boolean;
   hiddenStopIds: string[];
   maskOpacity: number;
   lineWidth: number;
+  drivingPreference?: DrivingPreference;
+  exportLegend?: boolean;
+  legendPosition?: NormalizedPoint;
   camera: MapCamera;
 };
 type ArchiveSummary = { id: string; kind: "auto" | "manual"; name: string; createdAt: number; updatedAt: number };
@@ -54,6 +60,13 @@ declare global {
 }
 
 const PALETTE = ["#f25f4b", "#008e88", "#efb72f", "#3867d6", "#9c5de8", "#d94786", "#4f772d"];
+const DRIVING_PREFERENCES: { value: DrivingPreference; label: string; hint: string; policy: number }[] = [
+  { value: "fastest", label: "速度优先", hint: "尽量缩短行驶时间", policy: 0 },
+  { value: "avoidCongestion", label: "躲避拥堵", hint: "结合实时路况绕开拥堵", policy: 4 },
+  { value: "avoidHighway", label: "不走高速", hint: "尽量避开高速道路", policy: 6 },
+  { value: "highwayFirst", label: "高速优先", hint: "有条件时优先选择高速", policy: 19 },
+  { value: "avoidTolls", label: "避免收费", hint: "优先选择少收费或免费道路", policy: 1 },
+];
 
 const BASES: Record<BaseKey, { name: string; hint: string; dark: boolean; tiles: string[]; labels: string[]; attribution: string }> = {
   paper: {
@@ -292,18 +305,56 @@ function segmentCollections(routes: TransitRoute[], width: number, scale = 1) {
     }
   });
 
+  // Bridge short matching gaps caused by different sampling around stops and intersections.
+  routeSegments.forEach((segments) => {
+    for (let index = 1; index < segments.length - 1; index += 1) {
+      if (segments[index].members.size > 1) continue;
+      const previous = segments[index - 1].members;
+      if (previous.size <= 1) continue;
+      let gapLength = 0;
+      for (let end = index; end < Math.min(segments.length, index + 6); end += 1) {
+        gapLength += segments[end].length;
+        if (segments[end].members.size <= 1) continue;
+        if (gapLength <= 180 && memberKey(previous, routeOrder) === memberKey(segments[end].members, routeOrder)) {
+          for (let fill = index; fill < end; fill += 1) segments[fill].members = new Set(previous);
+        }
+        break;
+      }
+    }
+  });
+
+  // Keep each route's physical lane side continuous around bends. A world-axis sign
+  // can flip at diagonal turns and temporarily swap two otherwise identical routes.
+  const laneSigns = new Map<string, number[]>();
+  routeSegments.forEach((segments, routeId) => {
+    let previousNormal: MetricPoint | null = null;
+    const signs = segments.map((segment) => {
+      if (segment.length <= 0.5) return 1;
+      const rawNormal = { x: -segment.dy / segment.length, y: segment.dx / segment.length };
+      let sign = Math.abs(segment.dx) >= Math.abs(segment.dy)
+        ? (segment.dx >= 0 ? 1 : -1)
+        : (segment.dy >= 0 ? 1 : -1);
+      let normal = { x: rawNormal.x * sign, y: rawNormal.y * sign };
+      if (previousNormal && normal.x * previousNormal.x + normal.y * previousNormal.y < 0) {
+        sign *= -1;
+        normal = { x: -normal.x, y: -normal.y };
+      }
+      previousNormal = normal;
+      return sign;
+    });
+    laneSigns.set(routeId, signs);
+  });
+
   const spacing = (width + 2) * scale;
   return new Map(active.map((route) => {
     const segments = routeSegments.get(route.id) ?? [];
-    const offsets = segments.map((segment) => {
+    const signs = laneSigns.get(route.id) ?? [];
+    const offsets = segments.map((segment, segmentIndex) => {
       if (segment.members.size <= 1 || segment.length <= 0.5) return 0;
       const members = [...segment.members].sort((a, b) => (routeOrder.get(a) ?? 0) - (routeOrder.get(b) ?? 0));
       const rank = members.indexOf(route.id);
       const laneOffset = (rank - (members.length - 1) / 2) * spacing;
-      const directionSign = Math.abs(segment.dx) >= Math.abs(segment.dy)
-        ? (segment.dx >= 0 ? 1 : -1)
-        : (segment.dy >= 0 ? 1 : -1);
-      return laneOffset * directionSign;
+      return laneOffset * (signs[segmentIndex] ?? 1);
     });
     const features: any[] = [];
     if (!segments.length) return [route.id, features];
@@ -374,6 +425,69 @@ function escapeXml(value: string) {
   return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" })[character] ?? character);
 }
 
+type LegendLayout = { x: number; y: number; width: number; height: number; padding: number; rowHeight: number; titleHeight: number };
+
+function getLegendLayout(width: number, height: number, routeCount: number, position: NormalizedPoint, renderScale: number): LegendLayout {
+  const padding = 13 * renderScale;
+  const rowHeight = 19 * renderScale;
+  const titleHeight = 23 * renderScale;
+  const boxWidth = Math.min(width * 0.56, 180 * renderScale);
+  const boxHeight = padding * 2 + titleHeight + routeCount * rowHeight;
+  const margin = 8 * renderScale;
+  return {
+    x: Math.max(margin, Math.min(width - boxWidth - margin, position.x * width)),
+    y: Math.max(margin, Math.min(height - boxHeight - margin, position.y * height)),
+    width: boxWidth,
+    height: boxHeight,
+    padding,
+    rowHeight,
+    titleHeight,
+  };
+}
+
+function drawCanvasLegend(context: CanvasRenderingContext2D, width: number, height: number, routes: TransitRoute[], position: NormalizedPoint, renderScale: number, showCasing: boolean) {
+  if (!routes.length) return;
+  const layout = getLegendLayout(width, height, routes.length, position, renderScale);
+  context.save();
+  context.fillStyle = "rgba(251,250,246,.95)";
+  context.strokeStyle = "rgba(34,48,53,.2)";
+  context.lineWidth = Math.max(1, renderScale);
+  context.fillRect(layout.x, layout.y, layout.width, layout.height);
+  context.strokeRect(layout.x, layout.y, layout.width, layout.height);
+  context.fillStyle = "#707a7c";
+  context.font = `800 ${8 * renderScale}px "Microsoft YaHei", sans-serif`;
+  context.fillText(`BUS ROUTES · ${String(routes.length).padStart(2, "0")}`, layout.x + layout.padding, layout.y + layout.padding + 8 * renderScale);
+  routes.forEach((route, index) => {
+    const y = layout.y + layout.padding + layout.titleHeight + index * layout.rowHeight + 7 * renderScale;
+    context.lineCap = "round";
+    if (showCasing) {
+      context.strokeStyle = "#ffffff";
+      context.lineWidth = 6 * renderScale;
+      context.beginPath(); context.moveTo(layout.x + layout.padding, y); context.lineTo(layout.x + layout.padding + 22 * renderScale, y); context.stroke();
+    }
+    context.strokeStyle = route.color;
+    context.lineWidth = 3 * renderScale;
+    context.beginPath(); context.moveTo(layout.x + layout.padding, y); context.lineTo(layout.x + layout.padding + 22 * renderScale, y); context.stroke();
+    context.fillStyle = "#17232b";
+    context.font = `700 ${9 * renderScale}px "Microsoft YaHei", sans-serif`;
+    const label = route.name.length > 18 ? `${route.name.slice(0, 17)}…` : route.name;
+    context.fillText(label, layout.x + layout.padding + 31 * renderScale, y + 3 * renderScale);
+  });
+  context.restore();
+}
+
+function makeSvgLegend(width: number, height: number, routes: TransitRoute[], position: NormalizedPoint, renderScale: number, showCasing: boolean) {
+  if (!routes.length) return "";
+  const layout = getLegendLayout(width, height, routes.length, position, renderScale);
+  const rows = routes.map((route, index) => {
+    const y = layout.y + layout.padding + layout.titleHeight + index * layout.rowHeight + 7 * renderScale;
+    const label = route.name.length > 18 ? `${route.name.slice(0, 17)}…` : route.name;
+    const casing = showCasing ? `<line x1="${(layout.x + layout.padding).toFixed(2)}" y1="${y.toFixed(2)}" x2="${(layout.x + layout.padding + 22 * renderScale).toFixed(2)}" y2="${y.toFixed(2)}" stroke="#ffffff" stroke-width="${(6 * renderScale).toFixed(2)}" stroke-linecap="round"/>` : "";
+    return `<g id="legend-route-${index + 1}" data-route-id="${escapeXml(route.id)}">${casing}<line x1="${(layout.x + layout.padding).toFixed(2)}" y1="${y.toFixed(2)}" x2="${(layout.x + layout.padding + 22 * renderScale).toFixed(2)}" y2="${y.toFixed(2)}" stroke="${escapeXml(route.color)}" stroke-width="${(3 * renderScale).toFixed(2)}" stroke-linecap="round"/><text x="${(layout.x + layout.padding + 31 * renderScale).toFixed(2)}" y="${(y + 3 * renderScale).toFixed(2)}" fill="#17232b" font-family="Microsoft YaHei, sans-serif" font-size="${(9 * renderScale).toFixed(2)}" font-weight="700">${escapeXml(label)}</text></g>`;
+  }).join("");
+  return `<g id="legend"><rect x="${layout.x.toFixed(2)}" y="${layout.y.toFixed(2)}" width="${layout.width.toFixed(2)}" height="${layout.height.toFixed(2)}" fill="#fbfaf6" fill-opacity=".95" stroke="#223035" stroke-opacity=".2"/><text x="${(layout.x + layout.padding).toFixed(2)}" y="${(layout.y + layout.padding + 8 * renderScale).toFixed(2)}" fill="#707a7c" font-family="Microsoft YaHei, sans-serif" font-size="${(8 * renderScale).toFixed(2)}" font-weight="800">BUS ROUTES · ${String(routes.length).padStart(2, "0")}</text>${rows}</g>`;
+}
+
 function offsetSvgPath(points: { x: number; y: number }[], offset: number) {
   if (points.length < 2) return "";
   const shifted = points.map((point, index) => {
@@ -401,6 +515,7 @@ function addRouteLayers(
   map: MapLibreMap,
   routes: TransitRoute[],
   width: number,
+  showCasing: boolean,
   showStops: boolean,
   scale = 1,
   stopMode: "all" | "terminals" = "all",
@@ -419,11 +534,13 @@ function addRouteLayers(
     [...offsetGroups.entries()].forEach(([offset, groupFeatures], groupIndex) => {
       const sourceId = `route-${route.id}-${groupIndex}`;
       map.addSource(sourceId, { type: "geojson", data: { type: "FeatureCollection", features: groupFeatures } as any });
-      map.addLayer({
-        id: `${sourceId}-casing`, type: "line", source: sourceId,
-        layout: { "line-cap": "round", "line-join": "bevel" },
-        paint: { "line-color": "#ffffff", "line-opacity": 0.92, "line-width": width * scale + 3 * scale, "line-offset": offset },
-      });
+      if (showCasing) {
+        map.addLayer({
+          id: `${sourceId}-casing`, type: "line", source: sourceId,
+          layout: { "line-cap": "round", "line-join": "bevel" },
+          paint: { "line-color": "#ffffff", "line-opacity": 0.92, "line-width": width * scale + 3 * scale, "line-offset": offset },
+        });
+      }
       map.addLayer({
         id: sourceId, type: "line", source: sourceId,
         layout: { "line-cap": "round", "line-join": "bevel" },
@@ -514,6 +631,7 @@ export default function Home() {
   const mapNode = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const dragStart = useRef<{ x: number; y: number } | null>(null);
+  const legendDrag = useRef<{ offsetX: number; offsetY: number } | null>(null);
   const [city, setCity] = useState("珠海市");
   const [query, setQuery] = useState("");
   const [routeEntryMode, setRouteEntryMode] = useState<"existing" | "custom">("existing");
@@ -521,11 +639,13 @@ export default function Home() {
   const [customStart, setCustomStart] = useState("");
   const [customEnd, setCustomEnd] = useState("");
   const [customNodes, setCustomNodes] = useState<CustomNode[]>([]);
+  const [drivingPreference, setDrivingPreference] = useState<DrivingPreference>("fastest");
   const [planningCustom, setPlanningCustom] = useState(false);
   const [routes, setRoutes] = useState<TransitRoute[]>([]);
   const [base, setBase] = useState<BaseKey>("paper");
   const [labels, setLabels] = useState(true);
   const [showStops, setShowStops] = useState(true);
+  const [showCasing, setShowCasing] = useState(false);
   const [stopMode, setStopMode] = useState<"all" | "terminals">("all");
   const [stopEditing, setStopEditing] = useState(false);
   const [hiddenStopIds, setHiddenStopIds] = useState<string[]>([]);
@@ -536,6 +656,8 @@ export default function Home() {
   const [crop, setCrop] = useState<CropRect | null>(null);
   const [scale, setScale] = useState(2);
   const [exportFormat, setExportFormat] = useState<ExportFormat>("png");
+  const [exportLegend, setExportLegend] = useState(true);
+  const [legendPosition, setLegendPosition] = useState<NormalizedPoint>({ x: 0.02, y: 0.78 });
   const [notice, setNotice] = useState("输入一条或多条线路开始制图");
   const [exporting, setExporting] = useState(false);
   const [camera, setCamera] = useState<MapCamera>({ center: [113.5767, 22.2707], zoom: 11.7, bearing: 0, pitch: 0 });
@@ -545,8 +667,11 @@ export default function Home() {
   const [archiveBusy, setArchiveBusy] = useState(false);
   const [autoSaveEnabled, setAutoSaveEnabled] = useState(true);
   const [autoSaveStatus, setAutoSaveStatus] = useState("正在读取存档…");
+  const [editingRouteId, setEditingRouteId] = useState<string | null>(null);
+  const [routeNameDraft, setRouteNameDraft] = useState("");
   const latestRoutesRef = useRef(routes);
   const latestLineWidthRef = useRef(lineWidth);
+  const latestShowCasingRef = useRef(showCasing);
   const latestShowStopsRef = useRef(showStops);
   const latestStopModeRef = useRef(stopMode);
   const latestStopEditingRef = useRef(stopEditing);
@@ -557,12 +682,14 @@ export default function Home() {
 
   latestRoutesRef.current = routes;
   latestLineWidthRef.current = lineWidth;
+  latestShowCasingRef.current = showCasing;
   latestShowStopsRef.current = showStops;
   latestStopModeRef.current = stopMode;
   latestStopEditingRef.current = stopEditing;
   latestHiddenStopIdsRef.current = hiddenStopIds;
 
   const readyRoutes = useMemo(() => routes.filter((route) => route.status === "ready"), [routes]);
+  const visibleReadyRoutes = useMemo(() => readyRoutes.filter((route) => route.visible), [readyRoutes]);
   const manualArchives = useMemo(() => archives.filter((archive) => archive.kind === "manual"), [archives]);
   const autoArchive = useMemo(() => archives.find((archive) => archive.kind === "auto"), [archives]);
 
@@ -574,13 +701,17 @@ export default function Home() {
     base,
     labels,
     showStops,
+    showCasing,
     stopMode,
     stopEditing,
     hiddenStopIds,
     maskOpacity,
     lineWidth,
+    drivingPreference,
+    exportLegend,
+    legendPosition,
     camera,
-  }), [city, routes, base, labels, showStops, stopMode, stopEditing, hiddenStopIds, maskOpacity, lineWidth, camera]);
+  }), [city, routes, base, labels, showStops, showCasing, stopMode, stopEditing, hiddenStopIds, maskOpacity, lineWidth, drivingPreference, exportLegend, legendPosition, camera]);
 
   const applyArchivePayload = useCallback((payload: ArchivePayload) => {
     if (!payload || payload.version !== 1 || !Array.isArray(payload.routes)) throw new Error("存档格式不受支持");
@@ -589,11 +720,15 @@ export default function Home() {
     if (payload.base && BASES[payload.base]) setBase(payload.base);
     setLabels(Boolean(payload.labels));
     setShowStops(Boolean(payload.showStops));
+    setShowCasing(Boolean(payload.showCasing));
     setStopMode(payload.stopMode === "terminals" ? "terminals" : "all");
     setStopEditing(Boolean(payload.stopEditing));
     setHiddenStopIds(Array.isArray(payload.hiddenStopIds) ? payload.hiddenStopIds : []);
     setMaskOpacity(Number.isFinite(payload.maskOpacity) ? payload.maskOpacity : 0);
     setLineWidth(Number.isFinite(payload.lineWidth) ? payload.lineWidth : 6);
+    if (payload.drivingPreference && DRIVING_PREFERENCES.some((item) => item.value === payload.drivingPreference)) setDrivingPreference(payload.drivingPreference);
+    setExportLegend(payload.exportLegend !== false);
+    if (payload.legendPosition && Number.isFinite(payload.legendPosition.x) && Number.isFinite(payload.legendPosition.y)) setLegendPosition(payload.legendPosition);
     setCrop(null);
     if (payload.camera) {
       setCamera(payload.camera);
@@ -756,7 +891,7 @@ export default function Home() {
     map.on("error", (event) => console.error("MAP_RENDER_ERROR", event.error?.message ?? event));
     map.once("style.load", () => {
       clearRouteLayers(map);
-      addRouteLayers(map, latestRoutesRef.current, latestLineWidthRef.current, latestShowStopsRef.current, 1, latestStopModeRef.current, latestHiddenStopIdsRef.current, latestStopEditingRef.current);
+      addRouteLayers(map, latestRoutesRef.current, latestLineWidthRef.current, latestShowCasingRef.current, latestShowStopsRef.current, 1, latestStopModeRef.current, latestHiddenStopIdsRef.current, latestStopEditingRef.current);
     });
     map.once("load", () => {
       if (pendingCameraRef.current) {
@@ -780,7 +915,7 @@ export default function Home() {
     map.setStyle(mapStyle(base, labels, maskOpacity));
     const restoreRoutes = () => {
       clearRouteLayers(map);
-      addRouteLayers(map, latestRoutesRef.current, latestLineWidthRef.current, latestShowStopsRef.current, 1, latestStopModeRef.current, latestHiddenStopIdsRef.current, latestStopEditingRef.current);
+      addRouteLayers(map, latestRoutesRef.current, latestLineWidthRef.current, latestShowCasingRef.current, latestShowStopsRef.current, 1, latestStopModeRef.current, latestHiddenStopIdsRef.current, latestStopEditingRef.current);
       map.triggerRepaint();
     };
     map.once("style.load", restoreRoutes);
@@ -803,13 +938,13 @@ export default function Home() {
     if (!map) return;
     const renderRoutes = () => {
       clearRouteLayers(map);
-      addRouteLayers(map, routes, lineWidth, showStops, 1, stopMode, hiddenStopIds, stopEditing);
+      addRouteLayers(map, routes, lineWidth, showCasing, showStops, 1, stopMode, hiddenStopIds, stopEditing);
       map.triggerRepaint();
     };
     if (map.isStyleLoaded()) renderRoutes();
     else map.once("style.load", renderRoutes);
     return () => { map.off("style.load", renderRoutes); };
-  }, [routes, lineWidth, showStops, stopMode, hiddenStopIds, stopEditing]);
+  }, [routes, lineWidth, showCasing, showStops, stopMode, hiddenStopIds, stopEditing]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -911,6 +1046,7 @@ export default function Home() {
       return;
     }
 
+    const drivingOption = DRIVING_PREFERENCES.find((item) => item.value === drivingPreference) ?? DRIVING_PREFERENCES[0];
     const id = `custom-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     const routeName = customName.trim() || `${start}—${end}`;
     const pending: TransitRoute = {
@@ -929,7 +1065,7 @@ export default function Home() {
     };
     setPlanningCustom(true);
     setRoutes((current) => [...current, pending]);
-    setNotice(`正在为 ${routeName} 规划路径…`);
+    setNotice(`正在为 ${routeName} 按“${drivingOption.label}”规划路径…`);
 
     try {
       const AMap = await loadAmap();
@@ -957,7 +1093,7 @@ export default function Home() {
         const origin = geocoded[index];
         const destination = geocoded[index + 1];
         const result: any = await new Promise((resolve, reject) => {
-          const driving = new AMap.Driving({ city, policy: 0, extensions: "all" });
+          const driving = new AMap.Driving({ city, policy: drivingOption.policy, extensions: "all" });
           driving.search(
             new AMap.LngLat(origin.gcj[0], origin.gcj[1]),
             new AMap.LngLat(destination.gcj[0], destination.gcj[1]),
@@ -982,7 +1118,7 @@ export default function Home() {
       setCustomStart("");
       setCustomEnd("");
       setCustomNodes([]);
-      setNotice(`${routeName} 已按高德导航加入画布`);
+      setNotice(`${routeName} 已按“${drivingOption.label}”加入画布`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "自定义线路规划失败";
       setRoutes((current) => current.map((route) => route.id === id ? { ...route, status: "error", error: message } : route));
@@ -996,9 +1132,58 @@ export default function Home() {
     setRoutes((current) => current.map((route) => route.id === id ? { ...route, ...patch } : route));
   }
 
+  function beginRenameRoute(route: TransitRoute) {
+    setEditingRouteId(route.id);
+    setRouteNameDraft(route.name);
+  }
+
+  function saveRouteName(id: string) {
+    const name = routeNameDraft.trim();
+    if (!name) {
+      setNotice("线路名称不能为空");
+      return;
+    }
+    updateRoute(id, { name, query: name });
+    setEditingRouteId(null);
+    setRouteNameDraft("");
+    setNotice(`线路已改名为 ${name}`);
+  }
+
   function removeRoute(id: string) {
     setRoutes((current) => current.filter((route) => route.id !== id));
+    if (editingRouteId === id) {
+      setEditingRouteId(null);
+      setRouteNameDraft("");
+    }
     setNotice("线路已移除");
+  }
+
+  function startLegendDrag(event: PointerEvent<HTMLDivElement>) {
+    const legendRect = event.currentTarget.getBoundingClientRect();
+    legendDrag.current = { offsetX: event.clientX - legendRect.left, offsetY: event.clientY - legendRect.top };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.currentTarget.classList.add("dragging");
+    event.stopPropagation();
+  }
+
+  function moveLegendDrag(event: PointerEvent<HTMLDivElement>) {
+    if (!legendDrag.current) return;
+    const stage = event.currentTarget.parentElement;
+    if (!stage) return;
+    const stageRect = stage.getBoundingClientRect();
+    const legendRect = event.currentTarget.getBoundingClientRect();
+    const x = Math.max(0, Math.min(stageRect.width - legendRect.width, event.clientX - stageRect.left - legendDrag.current.offsetX));
+    const y = Math.max(0, Math.min(stageRect.height - legendRect.height, event.clientY - stageRect.top - legendDrag.current.offsetY));
+    setLegendPosition({ x: x / Math.max(1, stageRect.width), y: y / Math.max(1, stageRect.height) });
+    event.stopPropagation();
+  }
+
+  function endLegendDrag(event: PointerEvent<HTMLDivElement>) {
+    legendDrag.current = null;
+    event.currentTarget.classList.remove("dragging");
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    setNotice("图例位置已更新，导出时会保持相同位置");
+    event.stopPropagation();
   }
 
   function startCrop(event: PointerEvent<HTMLDivElement>) {
@@ -1043,11 +1228,22 @@ export default function Home() {
       await new Promise<void>((resolve, reject) => {
         const timer = window.setTimeout(() => reject(new Error("底图加载超时")), 18000);
         exportMap!.once("load", () => {
-          addRouteLayers(exportMap!, routes, lineWidth, showStops, scale, stopMode, hiddenStopIds, false);
+          addRouteLayers(exportMap!, routes, lineWidth, showCasing, showStops, width / area.width, stopMode, hiddenStopIds, false);
           exportMap!.once("idle", () => { window.clearTimeout(timer); resolve(); });
         });
       });
-      const blob = await new Promise<Blob | null>((resolve) => exportMap!.getCanvas().toBlob(resolve, "image/png"));
+      const sourceCanvas = exportMap!.getCanvas();
+      let outputCanvas = sourceCanvas;
+      if (exportLegend && visibleReadyRoutes.length) {
+        outputCanvas = document.createElement("canvas");
+        outputCanvas.width = width;
+        outputCanvas.height = height;
+        const context = outputCanvas.getContext("2d");
+        if (!context) throw new Error("浏览器未能创建图例画布");
+        context.drawImage(sourceCanvas, 0, 0, width, height);
+        drawCanvasLegend(context, width, height, visibleReadyRoutes, legendPosition, width / area.width, showCasing);
+      }
+      const blob = await new Promise<Blob | null>((resolve) => outputCanvas.toBlob(resolve, "image/png"));
       if (!blob) throw new Error("浏览器未能生成图片");
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
@@ -1107,7 +1303,8 @@ export default function Home() {
           const d = offsetSvgPath(points, Number(feature.properties.offset) || 0);
           if (!d) return "";
           const dash = route.dash ? ` stroke-dasharray="${(lineWidth * renderScale * 1.8).toFixed(2)} ${(lineWidth * renderScale * 1.35).toFixed(2)}"` : "";
-          return `<g id="route-${routeIndex + 1}-part-${featureIndex + 1}"><path d="${d}" fill="none" stroke="#ffffff" stroke-opacity="0.92" stroke-width="${(lineWidth * renderScale + 3 * renderScale).toFixed(2)}" stroke-linecap="round" stroke-linejoin="bevel"/><path d="${d}" fill="none" stroke="${escapeXml(route.color)}" stroke-width="${(lineWidth * renderScale).toFixed(2)}" stroke-linecap="round" stroke-linejoin="bevel"${dash}/></g>`;
+          const casing = showCasing ? `<path d="${d}" fill="none" stroke="#ffffff" stroke-opacity="0.92" stroke-width="${(lineWidth * renderScale + 3 * renderScale).toFixed(2)}" stroke-linecap="round" stroke-linejoin="bevel"/>` : "";
+          return `<g id="route-${routeIndex + 1}-part-${featureIndex + 1}">${casing}<path d="${d}" fill="none" stroke="${escapeXml(route.color)}" stroke-width="${(lineWidth * renderScale).toFixed(2)}" stroke-linecap="round" stroke-linejoin="bevel"${dash}/></g>`;
         }).join("");
         return `<g id="route-${routeIndex + 1}" data-route-id="${escapeXml(route.id)}" data-route-name="${escapeXml(route.name)}"><title>${escapeXml(route.name)}</title>${paths}</g>`;
       }).join("");
@@ -1118,8 +1315,9 @@ export default function Home() {
         const stroke = stop.colors.size > 1 ? "#18252d" : [...stop.colors][0];
         return `<g id="station-${index + 1}" data-station-id="${escapeXml(stop.id)}" data-station-name="${escapeXml(stop.name)}"><title>${escapeXml(stop.name)}</title><circle cx="${point.x.toFixed(2)}" cy="${point.y.toFixed(2)}" r="${radius.toFixed(2)}" fill="#ffffff" stroke="${escapeXml(stroke)}" stroke-width="${(2 * renderScale).toFixed(2)}"/></g>`;
       }).join("") : "";
+      const legendMarkup = exportLegend ? makeSvgLegend(width, height, activeRoutes, legendPosition, renderScale, showCasing) : "";
 
-      const svg = `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeXml(city)}公交线路图"><title>${escapeXml(city)}公交线路图</title><metadata>由路绘导出；线路和站点均为独立矢量分组。</metadata><g id="basemap"><image href="${background}" x="0" y="0" width="${width}" height="${height}"/></g><g id="routes">${routeMarkup}</g><g id="stations">${stationMarkup}</g></svg>`;
+      const svg = `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeXml(city)}公交线路图"><title>${escapeXml(city)}公交线路图</title><metadata>由路绘导出；线路、站点和图例均为独立矢量分组。</metadata><g id="basemap"><image href="${background}" x="0" y="0" width="${width}" height="${height}"/></g><g id="routes">${routeMarkup}</g><g id="stations">${stationMarkup}</g>${legendMarkup}</svg>`;
       const blob = new Blob([svg], { type: "image/svg+xml;charset=utf-8" });
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
@@ -1175,6 +1373,7 @@ export default function Home() {
               <div className="custom-grid">
                 <label className="full">查询城市<input value={city} onChange={(event) => setCity(event.target.value)} placeholder="如：珠海市" aria-label="自定义线路查询城市" /></label>
                 <label className="full">线路名称（可选）<input value={customName} onChange={(event) => setCustomName(event.target.value)} placeholder="如：环城观光线" aria-label="自定义线路名称" /></label>
+                <label className="full">路径规划偏好<select value={drivingPreference} onChange={(event) => setDrivingPreference(event.target.value as DrivingPreference)} aria-label="自定义线路路径规划偏好">{DRIVING_PREFERENCES.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select><small>{DRIVING_PREFERENCES.find((item) => item.value === drivingPreference)?.hint}</small></label>
                 <label><span className="node-label"><i className="terminal">起</i>首站</span><input value={customStart} onChange={(event) => setCustomStart(event.target.value)} placeholder="输入地点或站名" aria-label="自定义线路首站" /></label>
                 <label><span className="node-label"><i className="terminal">终</i>末站</span><input value={customEnd} onChange={(event) => setCustomEnd(event.target.value)} placeholder="输入地点或站名" aria-label="自定义线路末站" /></label>
               </div>
@@ -1201,14 +1400,22 @@ export default function Home() {
 
             <div className="route-stack">
               {routes.length === 0 && <div className="empty-card"><div className="mini-map"><i /><i /><i /></div><h3>画布还是空的</h3><p>输入本地公交线路名称，高德将返回走向与站点。</p></div>}
-              {routes.map((route, index) => <article className={`route-card ${route.status}`} key={route.id}>
+              {routes.map((route, index) => <article className={`route-card ${route.status} ${route.visible ? "" : "hidden"}`} key={route.id}>
                 <div className="route-card-top">
-                  <button className={`eye ${route.visible ? "on" : ""}`} onClick={() => updateRoute(route.id, { visible: !route.visible })} aria-label={route.visible ? "隐藏线路" : "显示线路"}>●</button>
+                  <button type="button" className={`eye ${route.visible ? "on" : ""}`} onClick={() => updateRoute(route.id, { visible: !route.visible })} aria-label={route.visible ? `隐藏 ${route.name} 及其站点` : `显示 ${route.name} 及其站点`} title={route.visible ? "隐藏线路及其站点" : "显示线路及其站点"}>{route.visible ? "●" : "○"}</button>
                   <div className="route-index">{String(index + 1).padStart(2, "0")}</div>
-                  <div className="route-title"><strong>{route.name}{route.custom && <em>自定义</em>}</strong><span>{route.status === "searching" ? (route.custom ? "正在规划高德导航…" : "正在查询高德…") : route.status === "error" ? route.error : `${route.from} → ${route.to}`}</span></div>
+                  <div className="route-title">
+                    {editingRouteId === route.id ? <form className="route-rename" onSubmit={(event) => { event.preventDefault(); saveRouteName(route.id); }}>
+                      <input value={routeNameDraft} onChange={(event) => setRouteNameDraft(event.target.value)} aria-label={`${route.name} 的新名称`} autoFocus />
+                      <button type="submit" aria-label="保存新名称">✓</button>
+                      <button type="button" onClick={() => { setEditingRouteId(null); setRouteNameDraft(""); }} aria-label="取消改名">×</button>
+                    </form> : <strong><b>{route.name}</b>{route.custom && <em>自定义</em>}<button type="button" className="rename-route" onClick={() => beginRenameRoute(route)} aria-label={`修改 ${route.name} 的名称`}>改名</button></strong>}
+                    <span>{route.status === "searching" ? (route.custom ? "正在规划高德导航…" : "正在查询高德…") : route.status === "error" ? route.error : `${route.from} → ${route.to}`}</span>
+                  </div>
                   <button className="remove" onClick={() => removeRoute(route.id)} aria-label={`删除 ${route.name}`}>×</button>
                 </div>
                 {route.status === "ready" && <div className="route-tools">
+                  <button type="button" className={`visibility-control ${route.visible ? "selected" : ""}`} onClick={() => updateRoute(route.id, { visible: !route.visible })}>{route.visible ? "隐藏线路" : "显示线路"}</button>
                   <label className="color-control"><input type="color" value={route.color} onChange={(event) => updateRoute(route.id, { color: event.target.value })} /><span style={{ background: route.color }} />颜色</label>
                   <button className={route.dash ? "selected" : ""} onClick={() => updateRoute(route.id, { dash: !route.dash })}><i className={route.dash ? "dash" : "solid"} />{route.dash ? "虚线" : "实线"}</button>
                   <span>{route.path.length} 节点</span>
@@ -1226,6 +1433,7 @@ export default function Home() {
             </div>
             <div className="settings-list">
               <label><div><strong>地名与道路标注</strong><span>可独立于底图显示</span></div><input type="checkbox" checked={labels} onChange={(event) => setLabels(event.target.checked)} /><i /></label>
+              <label><div><strong>线路白色描边</strong><span>增强复杂底图上的线路对比，默认关闭</span></div><input type="checkbox" checked={showCasing} onChange={(event) => setShowCasing(event.target.checked)} /><i /></label>
               <label><div><strong>公交站点</strong><span>按线路颜色描边</span></div><input type="checkbox" checked={showStops} onChange={(event) => setShowStops(event.target.checked)} /><i /></label>
               <label><div><strong>仅显示首末站</strong><span>每条线路只保留起点和终点</span></div><input type="checkbox" checked={stopMode === "terminals"} onChange={(event) => setStopMode(event.target.checked ? "terminals" : "all")} /><i /></label>
               <label><div><strong>站点隐藏编辑</strong><span>点击地图站点可隐藏或恢复</span></div><input type="checkbox" checked={stopEditing} onChange={(event) => setStopEditing(event.target.checked)} /><i /></label>
@@ -1242,6 +1450,7 @@ export default function Home() {
               <button className={exportFormat === "png" ? "active" : ""} onClick={() => setExportFormat("png")}><strong>PNG</strong><span>通用高清图片</span></button>
               <button className={exportFormat === "svg" ? "active" : ""} onClick={() => setExportFormat("svg")}><strong>SVG</strong><span>线路与站点可编辑</span></button>
             </div>
+            <label className="export-legend-option"><div><strong>一同导出图例</strong><span>图例可直接在地图上拖动定位</span></div><input type="checkbox" checked={exportLegend} onChange={(event) => setExportLegend(event.target.checked)} /><i /></label>
             <button className={`range-button ${crop ? "has-range" : ""}`} onClick={() => { setCropMode(true); setNotice("在地图上拖动框选导出范围"); }}>
               <span className="crop-icon" />
               <div><strong>{crop ? "重新选择导出范围" : "框选导出范围"}</strong><small>{crop ? `${Math.round(crop.width)} × ${Math.round(crop.height)} 画布像素` : "在地图上自由拖出矩形"}</small></div><b>→</b>
@@ -1249,7 +1458,7 @@ export default function Home() {
             <div className="export-setting"><strong>清晰度倍率</strong><div className="scale-options">{[1, 2, 4].map((item) => <button className={scale === item ? "active" : ""} onClick={() => setScale(item)} key={item}>{item}×<small>{item === 1 ? "屏幕" : item === 2 ? "高清" : "印刷"}</small></button>)}</div></div>
             <div className="export-summary"><div><span>输出格式</span><strong>{exportFormat.toUpperCase()}</strong></div><div><span>底图风格</span><strong>{BASES[base].name}</strong></div><div><span>线路数量</span><strong>{readyRoutes.length}</strong></div><div><span>{exportFormat === "svg" ? "矢量结构" : "最大边长"}</span><strong>{exportFormat === "svg" ? "独立元素" : "8192 px"}</strong></div></div>
             <button className="primary export-button" disabled={exporting} onClick={() => void exportCurrent()}>{exporting ? (exportFormat === "svg" ? "正在生成可编辑 SVG…" : "正在渲染高清地图…") : `导出 ${scale}× ${exportFormat.toUpperCase()}`}</button>
-            <p className="privacy-note">{exportFormat === "svg" ? "底图以影像嵌入；每条线路和每个站点均为独立矢量分组。" : "导出在本机浏览器内完成，不上传线路图。"}</p>
+            <p className="privacy-note">{exportFormat === "svg" ? "底图以影像嵌入；每条线路、每个站点和图例均为独立矢量分组。" : "导出在本机浏览器内完成，不上传线路图。"}</p>
           </section>}
 
           {panel === "archive" && <section className="panel-section">
@@ -1287,9 +1496,9 @@ export default function Home() {
           <div className="location-chip"><span>制图城市</span><strong>{city || "未指定"}</strong></div>
           <div className="map-actions"><button onClick={() => fitRoutes(routes)} disabled={!readyRoutes.length}>适配线路</button><button onClick={() => setPanel("layers")}>{BASES[base].name}</button><button onClick={() => setLabels(!labels)} className={labels ? "active" : ""}>标注</button></div>
         </div>
-        {readyRoutes.length > 0 && <div className="legend">
-          <p>BUS ROUTES · {String(readyRoutes.length).padStart(2, "0")}</p>
-          {readyRoutes.slice(0, 7).map((route) => <div key={route.id}><i style={{ background: route.color }} /><span>{route.name}</span></div>)}
+        {visibleReadyRoutes.length > 0 && <div className="legend" style={{ left: `${legendPosition.x * 100}%`, top: `${legendPosition.y * 100}%` }} onPointerDown={startLegendDrag} onPointerMove={moveLegendDrag} onPointerUp={endLegendDrag} onPointerCancel={endLegendDrag} role="group" aria-label="可拖动线路图例">
+          <p>BUS ROUTES · {String(visibleReadyRoutes.length).padStart(2, "0")}<b>拖动</b></p>
+          {visibleReadyRoutes.map((route) => <div key={route.id}><i style={{ background: route.color }} /><span>{route.name}</span></div>)}
         </div>}
         {readyRoutes.length === 0 && <div className="map-onboarding"><span>01</span><div><strong>输入线路，开始绘制</strong><p>支持多线路自动并行、卫星底图与高清框选导出</p></div></div>}
         <div className="scale-note">数据：高德开放平台 · 底图：{BASES[base].name}</div>
