@@ -156,21 +156,152 @@ function loadAmap() {
   return amapPromise;
 }
 
+type MetricPoint = { x: number; y: number };
+type RouteSegment = {
+  routeId: string;
+  index: number;
+  a: MetricPoint;
+  b: MetricPoint;
+  dx: number;
+  dy: number;
+  length: number;
+  members: Set<string>;
+};
+
+function pointSegmentDistance(point: MetricPoint, a: MetricPoint, b: MetricPoint) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const lengthSquared = dx * dx + dy * dy;
+  if (!lengthSquared) return Math.hypot(point.x - a.x, point.y - a.y);
+  const t = Math.max(0, Math.min(1, ((point.x - a.x) * dx + (point.y - a.y) * dy) / lengthSquared));
+  return Math.hypot(point.x - (a.x + t * dx), point.y - (a.y + t * dy));
+}
+
+function memberKey(members: Set<string>, order: Map<string, number>) {
+  return [...members].sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0)).join("|");
+}
+
 function segmentCollections(routes: TransitRoute[], width: number, scale = 1) {
   const active = routes.filter((route) => route.visible && route.status === "ready");
-  const center = (active.length - 1) / 2;
-  return new Map(active.map((route, index) => {
-    const start = route.path[0];
-    const end = route.path[route.path.length - 1];
-    const deltaLng = end[0] - start[0];
-    const deltaLat = end[1] - start[1];
-    const reverse = Math.abs(deltaLng) >= Math.abs(deltaLat) ? deltaLng < 0 : deltaLat < 0;
-    const coordinates = reverse ? [...route.path].reverse() : route.path;
-    return [route.id, [{
+  if (!active.length) return new Map<string, any[]>();
+
+  const routeOrder = new Map(active.map((route, index) => [route.id, index]));
+  const latitudes = active.flatMap((route) => route.path.map((coord) => coord[1]));
+  const referenceLatitude = (latitudes.reduce((sum, latitude) => sum + latitude, 0) / Math.max(1, latitudes.length)) * Math.PI / 180;
+  const toMetric = ([lng, lat]: Coord): MetricPoint => ({
+    x: lng * 111320 * Math.cos(referenceLatitude),
+    y: lat * 110540,
+  });
+
+  const routeSegments = new Map<string, RouteSegment[]>();
+  const allSegments: RouteSegment[] = [];
+  active.forEach((route) => {
+    const metricPath = route.path.map(toMetric);
+    const segments = route.path.slice(0, -1).map((_, index) => {
+      const a = metricPath[index];
+      const b = metricPath[index + 1];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const segment: RouteSegment = {
+        routeId: route.id,
+        index,
+        a,
+        b,
+        dx,
+        dy,
+        length: Math.hypot(dx, dy),
+        members: new Set([route.id]),
+      };
+      allSegments.push(segment);
+      return segment;
+    });
+    routeSegments.set(route.id, segments);
+  });
+
+  const proximity = 38;
+  const cellSize = 64;
+  const grid = new Map<string, RouteSegment[]>();
+  const gridKey = (x: number, y: number) => `${x}:${y}`;
+  allSegments.filter((segment) => segment.length > 0.5).forEach((segment) => {
+    const minX = Math.floor((Math.min(segment.a.x, segment.b.x) - proximity) / cellSize);
+    const maxX = Math.floor((Math.max(segment.a.x, segment.b.x) + proximity) / cellSize);
+    const minY = Math.floor((Math.min(segment.a.y, segment.b.y) - proximity) / cellSize);
+    const maxY = Math.floor((Math.max(segment.a.y, segment.b.y) + proximity) / cellSize);
+    for (let x = minX; x <= maxX; x += 1) {
+      for (let y = minY; y <= maxY; y += 1) {
+        const key = gridKey(x, y);
+        grid.set(key, [...(grid.get(key) ?? []), segment]);
+      }
+    }
+  });
+
+  allSegments.filter((segment) => segment.length > 0.5).forEach((segment) => {
+    const midpoint = { x: (segment.a.x + segment.b.x) / 2, y: (segment.a.y + segment.b.y) / 2 };
+    const candidates = grid.get(gridKey(Math.floor(midpoint.x / cellSize), Math.floor(midpoint.y / cellSize))) ?? [];
+    candidates.forEach((candidate) => {
+      if (candidate.routeId === segment.routeId || candidate.length <= 0.5) return;
+      const parallel = Math.abs((segment.dx * candidate.dx + segment.dy * candidate.dy) / (segment.length * candidate.length));
+      if (parallel < 0.72) return;
+      const candidateMidpoint = { x: (candidate.a.x + candidate.b.x) / 2, y: (candidate.a.y + candidate.b.y) / 2 };
+      const separation = Math.min(
+        pointSegmentDistance(midpoint, candidate.a, candidate.b),
+        pointSegmentDistance(candidateMidpoint, segment.a, segment.b),
+      );
+      if (separation > proximity) return;
+      segment.members.add(candidate.routeId);
+      candidate.members.add(segment.routeId);
+    });
+  });
+
+  routeSegments.forEach((segments) => {
+    for (let pass = 0; pass < 2; pass += 1) {
+      for (let index = 1; index < segments.length - 1; index += 1) {
+        if (segments[index].members.size > 1) continue;
+        const previous = segments[index - 1].members;
+        const next = segments[index + 1].members;
+        if (previous.size > 1 && memberKey(previous, routeOrder) === memberKey(next, routeOrder)) {
+          segments[index].members = new Set(previous);
+        }
+      }
+    }
+  });
+
+  const spacing = (width + 2) * scale;
+  return new Map(active.map((route) => {
+    const segments = routeSegments.get(route.id) ?? [];
+    const offsets = segments.map((segment) => {
+      if (segment.members.size <= 1 || segment.length <= 0.5) return 0;
+      const members = [...segment.members].sort((a, b) => (routeOrder.get(a) ?? 0) - (routeOrder.get(b) ?? 0));
+      const rank = members.indexOf(route.id);
+      const laneOffset = (rank - (members.length - 1) / 2) * spacing;
+      const directionSign = Math.abs(segment.dx) >= Math.abs(segment.dy)
+        ? (segment.dx >= 0 ? 1 : -1)
+        : (segment.dy >= 0 ? 1 : -1);
+      return laneOffset * directionSign;
+    });
+    const features: any[] = [];
+    if (!segments.length) return [route.id, features];
+    let currentOffset = offsets[0];
+    let coordinates: Coord[] = [route.path[0], route.path[1]];
+    for (let index = 1; index < segments.length; index += 1) {
+      if (Math.abs(offsets[index] - currentOffset) < 0.01) {
+        coordinates.push(route.path[index + 1]);
+        continue;
+      }
+      features.push({
+        type: "Feature",
+        properties: { offset: currentOffset },
+        geometry: { type: "LineString", coordinates },
+      });
+      currentOffset = offsets[index];
+      coordinates = [route.path[index], route.path[index + 1]];
+    }
+    features.push({
       type: "Feature",
-      properties: { offset: (index - center) * (width + 2) * scale },
+      properties: { offset: currentOffset },
       geometry: { type: "LineString", coordinates },
-    }]];
+    });
+    return [route.id, features];
   }));
 }
 
@@ -276,6 +407,7 @@ function addRouteLayers(
               stroke: stop.colors.size > 1 ? "#18252d" : [...stop.colors][0],
               hidden: hiddenSet.has(stop.id),
               terminal: stop.terminal,
+              radius: ((stop.terminal ? 4.5 : 3.5) + Math.min(3, stop.colors.size - 1) * 2) * scale,
             },
             geometry: { type: "Point", coordinates: stop.coord },
           })),
@@ -286,7 +418,7 @@ function addRouteLayers(
         type: "circle",
         source: stopId,
         paint: {
-          "circle-radius": ["case", ["get", "hidden"], 4 * scale, ["get", "terminal"], 4.5 * scale, 3.5 * scale],
+          "circle-radius": ["case", ["get", "hidden"], 4 * scale, ["get", "radius"]],
           "circle-color": ["case", ["get", "hidden"], "#c9cdcb", "#fff"],
           "circle-stroke-width": 2 * scale,
           "circle-stroke-color": ["case", ["get", "hidden"], "#7c8582", ["get", "stroke"]],
@@ -345,6 +477,7 @@ export default function Home() {
   latestHiddenStopIdsRef.current = hiddenStopIds;
 
   const readyRoutes = useMemo(() => routes.filter((route) => route.status === "ready"), [routes]);
+
 
   useEffect(() => {
     if (!mapNode.current || mapRef.current) return;
