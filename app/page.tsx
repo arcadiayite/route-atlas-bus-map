@@ -223,11 +223,21 @@ export default function Home() {
   const [scale, setScale] = useState(2);
   const [notice, setNotice] = useState("输入一条或多条线路开始制图");
   const [exporting, setExporting] = useState(false);
+  const latestRoutesRef = useRef(routes);
+  const latestLineWidthRef = useRef(lineWidth);
+  const latestShowStopsRef = useRef(showStops);
+  const styleKeyRef = useRef(`${base}:${labels}`);
+  const fitAfterLoadRef = useRef(false);
+
+  latestRoutesRef.current = routes;
+  latestLineWidthRef.current = lineWidth;
+  latestShowStopsRef.current = showStops;
 
   const readyRoutes = useMemo(() => routes.filter((route) => route.status === "ready"), [routes]);
 
   useEffect(() => {
     if (!mapNode.current || mapRef.current) return;
+    maplibregl.setWorkerUrl("/maplibre-gl-worker.mjs");
     const map = new maplibregl.Map({
       container: mapNode.current,
       style: mapStyle(base, labels),
@@ -242,6 +252,10 @@ export default function Home() {
     map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-right");
     mapRef.current = map;
     map.on("error", (event) => console.error("MAP_RENDER_ERROR", event.error?.message ?? event));
+    map.once("style.load", () => {
+      clearRouteLayers(map);
+      addRouteLayers(map, latestRoutesRef.current, latestLineWidthRef.current, latestShowStopsRef.current);
+    });
     const observer = new ResizeObserver(() => map.resize());
     observer.observe(mapNode.current);
     return () => { observer.disconnect(); map.remove(); mapRef.current = null; };
@@ -250,8 +264,17 @@ export default function Home() {
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
+    const styleKey = `${base}:${labels}`;
+    if (styleKeyRef.current === styleKey) return;
+    styleKeyRef.current = styleKey;
     map.setStyle(mapStyle(base, labels));
-    map.once("style.load", () => addRouteLayers(map, routes, lineWidth, showStops));
+    const restoreRoutes = () => {
+      clearRouteLayers(map);
+      addRouteLayers(map, latestRoutesRef.current, latestLineWidthRef.current, latestShowStopsRef.current);
+      map.triggerRepaint();
+    };
+    map.once("style.load", restoreRoutes);
+    return () => { map.off("style.load", restoreRoutes); };
   }, [base, labels]);
 
   useEffect(() => {
@@ -260,6 +283,7 @@ export default function Home() {
     const renderRoutes = () => {
       clearRouteLayers(map);
       addRouteLayers(map, routes, lineWidth, showStops);
+      map.triggerRepaint();
     };
     if (map.isStyleLoaded()) renderRoutes();
     else map.once("style.load", renderRoutes);
@@ -272,6 +296,12 @@ export default function Home() {
     const bounds = coords.reduce((box, coord) => box.extend(coord), new maplibregl.LngLatBounds(coords[0], coords[0]));
     mapRef.current.fitBounds(bounds, { padding: 74, maxZoom: 15, duration: 900 });
   }, []);
+
+  useEffect(() => {
+    if (!fitAfterLoadRef.current || !routes.some((route) => route.status === "ready")) return;
+    fitAfterLoadRef.current = false;
+    fitRoutes(routes);
+  }, [routes, fitRoutes]);
 
   async function searchOne(term: string, index: number) {
     const id = `${Date.now()}-${index}-${Math.random().toString(36).slice(2, 6)}`;
@@ -298,18 +328,8 @@ export default function Home() {
         stops,
         status: "ready",
       };
-      setRoutes((current) => {
-        const next = current.map((route) => route.id === id ? ready : route);
-        window.setTimeout(() => {
-          const currentMap = mapRef.current;
-          if (currentMap?.isStyleLoaded()) {
-            clearRouteLayers(currentMap);
-            addRouteLayers(currentMap, next, lineWidth, showStops);
-          }
-          fitRoutes(next);
-        }, 80);
-        return next;
-      });
+      fitAfterLoadRef.current = true;
+      setRoutes((current) => current.map((route) => route.id === id ? ready : route));
       setNotice(`${ready.name} 已加入画布`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "查询失败";
