@@ -69,16 +69,28 @@ const BASES: Record<BaseKey, { name: string; hint: string; dark: boolean; tiles:
   },
 };
 
-function mapStyle(base: BaseKey, labels: boolean): StyleSpecification {
+function mapStyle(base: BaseKey, labels: boolean, maskOpacity = 0): StyleSpecification {
   const item = BASES[base];
   const sources: StyleSpecification["sources"] = {
     basemap: { type: "raster", tiles: item.tiles, tileSize: 256, attribution: item.attribution },
+    mask: {
+      type: "geojson",
+      data: {
+        type: "Feature",
+        properties: {},
+        geometry: {
+          type: "Polygon",
+          coordinates: [[[-180, -85], [180, -85], [180, 85], [-180, 85], [-180, -85]]],
+        },
+      },
+    } as any,
   };
   const layers: any[] = [{ id: "basemap", type: "raster", source: "basemap", minzoom: 0, maxzoom: 22 }];
   if (labels) {
     sources.labels = { type: "raster", tiles: item.labels, tileSize: 256 };
     layers.push({ id: "place-labels", type: "raster", source: "labels", minzoom: 0, maxzoom: 22 });
   }
+  layers.push({ id: "map-mask", type: "fill", source: "mask", paint: { "fill-color": "#ffffff", "fill-opacity": maskOpacity } });
   return { version: 8, sources, layers };
 }
 
@@ -266,6 +278,7 @@ export default function Home() {
   const [base, setBase] = useState<BaseKey>("paper");
   const [labels, setLabels] = useState(true);
   const [showStops, setShowStops] = useState(true);
+  const [maskOpacity, setMaskOpacity] = useState(0);
   const [lineWidth, setLineWidth] = useState(6);
   const [panel, setPanel] = useState<"routes" | "layers" | "export">("routes");
   const [cropMode, setCropMode] = useState(false);
@@ -290,7 +303,7 @@ export default function Home() {
     maplibregl.setWorkerUrl("/maplibre-gl-worker.mjs");
     const map = new maplibregl.Map({
       container: mapNode.current,
-      style: mapStyle(base, labels),
+      style: mapStyle(base, labels, maskOpacity),
       center: [113.5767, 22.2707],
       zoom: 11.7,
       minZoom: 3,
@@ -317,7 +330,7 @@ export default function Home() {
     const styleKey = `${base}:${labels}`;
     if (styleKeyRef.current === styleKey) return;
     styleKeyRef.current = styleKey;
-    map.setStyle(mapStyle(base, labels));
+    map.setStyle(mapStyle(base, labels, maskOpacity));
     const restoreRoutes = () => {
       clearRouteLayers(map);
       addRouteLayers(map, latestRoutesRef.current, latestLineWidthRef.current, latestShowStopsRef.current);
@@ -326,6 +339,17 @@ export default function Home() {
     map.once("style.load", restoreRoutes);
     return () => { map.off("style.load", restoreRoutes); };
   }, [base, labels]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const applyMask = () => {
+      if (map.getLayer("map-mask")) map.setPaintProperty("map-mask", "fill-opacity", maskOpacity);
+    };
+    if (map.isStyleLoaded()) applyMask();
+    else map.once("style.load", applyMask);
+    return () => { map.off("style.load", applyMask); };
+  }, [maskOpacity]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -444,7 +468,7 @@ export default function Home() {
     document.body.appendChild(node);
     let exportMap: MapLibreMap | null = null;
     try {
-      exportMap = new maplibregl.Map({ container: node, style: mapStyle(base, labels), bounds: [[nw.lng, se.lat], [se.lng, nw.lat]], fitBoundsOptions: { padding: 0 }, interactive: false, attributionControl: false, preserveDrawingBuffer: true, fadeDuration: 0 });
+      exportMap = new maplibregl.Map({ container: node, style: mapStyle(base, labels, maskOpacity), bounds: [[nw.lng, se.lat], [se.lng, nw.lat]], fitBoundsOptions: { padding: 0 }, interactive: false, attributionControl: false, preserveDrawingBuffer: true, fadeDuration: 0 });
       await new Promise<void>((resolve, reject) => {
         const timer = window.setTimeout(() => reject(new Error("底图加载超时")), 18000);
         exportMap!.once("load", () => {
@@ -523,6 +547,7 @@ export default function Home() {
               <label><div><strong>地名与道路标注</strong><span>可独立于底图显示</span></div><input type="checkbox" checked={labels} onChange={(event) => setLabels(event.target.checked)} /><i /></label>
               <label><div><strong>公交站点</strong><span>按线路颜色描边</span></div><input type="checkbox" checked={showStops} onChange={(event) => setShowStops(event.target.checked)} /><i /></label>
             </div>
+            <div className="width-setting"><div><strong>底图淡化蒙版</strong><output>{maskOpacity === 0 ? "透明" : `${Math.round(maskOpacity * 100)}%`}</output></div><input aria-label="底图淡化蒙版不透明度" type="range" min="0" max="85" step="5" value={Math.round(maskOpacity * 100)} onChange={(event) => setMaskOpacity(Number(event.target.value) / 100)} /></div>
             <div className="width-setting"><div><strong>线路宽度</strong><output>{lineWidth} px</output></div><input type="range" min="3" max="12" value={lineWidth} onChange={(event) => setLineWidth(Number(event.target.value))} /></div>
             <div className="info-note"><b>自动并行排线</b><p>多线路以相同线宽、等间距居中排列，走向重合时仍可清晰辨认。</p></div>
           </section>}
