@@ -1298,15 +1298,14 @@ export default function Home() {
       const activeRoutes = routes.filter((route) => route.visible && route.status === "ready");
       const routeMarkup = activeRoutes.map((route, routeIndex) => {
         const features = collections.get(route.id) ?? [];
-        const paths = features.map((feature, featureIndex) => {
+        const combinedPath = features.map((feature) => {
           const points = (feature.geometry.coordinates as Coord[]).map((coord) => exportMap!.project(coord));
-          const d = offsetSvgPath(points, Number(feature.properties.offset) || 0);
-          if (!d) return "";
-          const dash = route.dash ? ` stroke-dasharray="${(lineWidth * renderScale * 1.8).toFixed(2)} ${(lineWidth * renderScale * 1.35).toFixed(2)}"` : "";
-          const casing = showCasing ? `<path d="${d}" fill="none" stroke="#ffffff" stroke-opacity="0.92" stroke-width="${(lineWidth * renderScale + 3 * renderScale).toFixed(2)}" stroke-linecap="round" stroke-linejoin="bevel"/>` : "";
-          return `<g id="route-${routeIndex + 1}-part-${featureIndex + 1}">${casing}<path d="${d}" fill="none" stroke="${escapeXml(route.color)}" stroke-width="${(lineWidth * renderScale).toFixed(2)}" stroke-linecap="round" stroke-linejoin="bevel"${dash}/></g>`;
-        }).join("");
-        return `<g id="route-${routeIndex + 1}" data-route-id="${escapeXml(route.id)}" data-route-name="${escapeXml(route.name)}"><title>${escapeXml(route.name)}</title>${paths}</g>`;
+          return offsetSvgPath(points, Number(feature.properties.offset) || 0);
+        }).filter(Boolean).join(" ");
+        if (!combinedPath) return "";
+        const dash = route.dash ? ` stroke-dasharray="${(lineWidth * renderScale * 1.8).toFixed(2)} ${(lineWidth * renderScale * 1.35).toFixed(2)}"` : "";
+        const casingFilter = showCasing ? ` filter="url(#route-casing)"` : "";
+        return `<g id="route-${routeIndex + 1}" data-route-id="${escapeXml(route.id)}" data-route-name="${escapeXml(route.name)}"><title>${escapeXml(route.name)}</title><path id="route-${routeIndex + 1}-path" d="${combinedPath}" fill="none" stroke="${escapeXml(route.color)}" stroke-width="${(lineWidth * renderScale).toFixed(2)}" stroke-linecap="round" stroke-linejoin="bevel"${dash}${casingFilter}/></g>`;
       }).join("");
 
       const stationMarkup = showStops ? collectExportStops(routes, stopMode, hiddenStopIds).map((stop, index) => {
@@ -1316,8 +1315,9 @@ export default function Home() {
         return `<g id="station-${index + 1}" data-station-id="${escapeXml(stop.id)}" data-station-name="${escapeXml(stop.name)}"><title>${escapeXml(stop.name)}</title><circle cx="${point.x.toFixed(2)}" cy="${point.y.toFixed(2)}" r="${radius.toFixed(2)}" fill="#ffffff" stroke="${escapeXml(stroke)}" stroke-width="${(2 * renderScale).toFixed(2)}"/></g>`;
       }).join("") : "";
       const legendMarkup = exportLegend ? makeSvgLegend(width, height, activeRoutes, legendPosition, renderScale, showCasing) : "";
+      const casingFilter = showCasing ? `<defs><filter id="route-casing" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB"><feMorphology in="SourceAlpha" operator="dilate" radius="${(1.5 * renderScale).toFixed(2)}" result="expanded"/><feFlood flood-color="#ffffff" flood-opacity=".92" result="white"/><feComposite in="white" in2="expanded" operator="in" result="casing"/><feMerge><feMergeNode in="casing"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>` : "";
 
-      const svg = `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeXml(city)}公交线路图"><title>${escapeXml(city)}公交线路图</title><metadata>由路绘导出；线路、站点和图例均为独立矢量分组。</metadata><g id="basemap"><image href="${background}" x="0" y="0" width="${width}" height="${height}"/></g><g id="routes">${routeMarkup}</g><g id="stations">${stationMarkup}</g>${legendMarkup}</svg>`;
+      const svg = `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeXml(city)}公交线路图"><title>${escapeXml(city)}公交线路图</title><metadata>由路绘导出；每条线路均为单一路径元素，站点和图例为独立矢量分组。</metadata>${casingFilter}<g id="basemap"><image href="${background}" x="0" y="0" width="${width}" height="${height}"/></g><g id="routes">${routeMarkup}</g><g id="stations">${stationMarkup}</g>${legendMarkup}</svg>`;
       const blob = new Blob([svg], { type: "image/svg+xml;charset=utf-8" });
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
