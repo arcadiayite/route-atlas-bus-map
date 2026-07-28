@@ -195,7 +195,16 @@ function clearRouteLayers(map: MapLibreMap) {
   });
 }
 
-function addRouteLayers(map: MapLibreMap, routes: TransitRoute[], width: number, showStops: boolean, scale = 1) {
+function addRouteLayers(
+  map: MapLibreMap,
+  routes: TransitRoute[],
+  width: number,
+  showStops: boolean,
+  scale = 1,
+  stopMode: "all" | "terminals" = "all",
+  hiddenStopIds: string[] = [],
+  revealHiddenStops = false,
+) {
   const activeRoutes = routes.filter((route) => route.visible && route.status === "ready");
   const collections = segmentCollections(routes, width, scale);
   activeRoutes.forEach((route) => {
@@ -228,26 +237,45 @@ function addRouteLayers(map: MapLibreMap, routes: TransitRoute[], width: number,
   });
 
   if (showStops) {
-    const mergedStops: { name: string; key: string; coord: Coord; colors: Set<string> }[] = [];
+    const hiddenSet = new Set(hiddenStopIds);
+    const mergedStops: { id: string; name: string; key: string; coord: Coord; coords: Coord[]; colors: Set<string>; terminal: boolean }[] = [];
     activeRoutes.forEach((route) => {
-      route.stops.forEach((stop) => {
+      const routeStops = stopMode === "terminals"
+        ? route.stops.filter((_, index) => index === 0 || index === route.stops.length - 1)
+        : route.stops;
+      routeStops.forEach((stop, index) => {
         const key = stopKey(stop.name);
-        const existing = mergedStops.find((item) => item.key === key && stopDistanceMetres(item.coord, stop.coord) <= 25);
-        if (existing) existing.colors.add(route.color);
-        else mergedStops.push({ name: stop.name, key, coord: stop.coord, colors: new Set([route.color]) });
+        const terminal = stopMode === "terminals" || index === 0 || index === routeStops.length - 1;
+        const existing = mergedStops.find((item) => item.key === key && stopDistanceMetres(item.coord, stop.coord) <= 80);
+        if (existing) {
+          existing.colors.add(route.color);
+          existing.coords.push(stop.coord);
+          existing.terminal ||= terminal;
+          existing.coord = [
+            existing.coords.reduce((sum, coord) => sum + coord[0], 0) / existing.coords.length,
+            existing.coords.reduce((sum, coord) => sum + coord[1], 0) / existing.coords.length,
+          ];
+        } else {
+          const id = `${key}:${Math.round(stop.coord[0] * 100)}:${Math.round(stop.coord[1] * 100)}`;
+          mergedStops.push({ id, name: stop.name, key, coord: stop.coord, coords: [stop.coord], colors: new Set([route.color]), terminal });
+        }
       });
     });
-    if (mergedStops.length) {
+    const drawableStops = mergedStops.filter((stop) => revealHiddenStops || !hiddenSet.has(stop.id));
+    if (drawableStops.length) {
       const stopId = "stops-all";
       map.addSource(stopId, {
         type: "geojson",
         data: {
           type: "FeatureCollection",
-          features: mergedStops.map((stop) => ({
+          features: drawableStops.map((stop) => ({
             type: "Feature",
             properties: {
+              id: stop.id,
               name: stop.name,
               stroke: stop.colors.size > 1 ? "#18252d" : [...stop.colors][0],
+              hidden: hiddenSet.has(stop.id),
+              terminal: stop.terminal,
             },
             geometry: { type: "Point", coordinates: stop.coord },
           })),
@@ -258,10 +286,21 @@ function addRouteLayers(map: MapLibreMap, routes: TransitRoute[], width: number,
         type: "circle",
         source: stopId,
         paint: {
-          "circle-radius": 3.5 * scale,
-          "circle-color": "#fff",
+          "circle-radius": ["case", ["get", "hidden"], 4 * scale, ["get", "terminal"], 4.5 * scale, 3.5 * scale],
+          "circle-color": ["case", ["get", "hidden"], "#c9cdcb", "#fff"],
           "circle-stroke-width": 2 * scale,
-          "circle-stroke-color": ["get", "stroke"],
+          "circle-stroke-color": ["case", ["get", "hidden"], "#7c8582", ["get", "stroke"]],
+          "circle-opacity": ["case", ["get", "hidden"], 0.35, 1],
+          "circle-stroke-opacity": ["case", ["get", "hidden"], 0.65, 1],
+        },
+      });      map.addLayer({
+        id: "stops-hit",
+        type: "circle",
+        source: stopId,
+        paint: {
+          "circle-radius": 11 * scale,
+          "circle-color": "#000",
+          "circle-opacity": 0.01,
         },
       });
     }
@@ -278,6 +317,9 @@ export default function Home() {
   const [base, setBase] = useState<BaseKey>("paper");
   const [labels, setLabels] = useState(true);
   const [showStops, setShowStops] = useState(true);
+  const [stopMode, setStopMode] = useState<"all" | "terminals">("all");
+  const [stopEditing, setStopEditing] = useState(false);
+  const [hiddenStopIds, setHiddenStopIds] = useState<string[]>([]);
   const [maskOpacity, setMaskOpacity] = useState(0);
   const [lineWidth, setLineWidth] = useState(6);
   const [panel, setPanel] = useState<"routes" | "layers" | "export">("routes");
@@ -289,12 +331,18 @@ export default function Home() {
   const latestRoutesRef = useRef(routes);
   const latestLineWidthRef = useRef(lineWidth);
   const latestShowStopsRef = useRef(showStops);
+  const latestStopModeRef = useRef(stopMode);
+  const latestStopEditingRef = useRef(stopEditing);
+  const latestHiddenStopIdsRef = useRef(hiddenStopIds);
   const styleKeyRef = useRef(`${base}:${labels}`);
   const fitAfterLoadRef = useRef(false);
 
   latestRoutesRef.current = routes;
   latestLineWidthRef.current = lineWidth;
   latestShowStopsRef.current = showStops;
+  latestStopModeRef.current = stopMode;
+  latestStopEditingRef.current = stopEditing;
+  latestHiddenStopIdsRef.current = hiddenStopIds;
 
   const readyRoutes = useMemo(() => routes.filter((route) => route.status === "ready"), [routes]);
 
@@ -317,7 +365,7 @@ export default function Home() {
     map.on("error", (event) => console.error("MAP_RENDER_ERROR", event.error?.message ?? event));
     map.once("style.load", () => {
       clearRouteLayers(map);
-      addRouteLayers(map, latestRoutesRef.current, latestLineWidthRef.current, latestShowStopsRef.current);
+      addRouteLayers(map, latestRoutesRef.current, latestLineWidthRef.current, latestShowStopsRef.current, 1, latestStopModeRef.current, latestHiddenStopIdsRef.current, latestStopEditingRef.current);
     });
     const observer = new ResizeObserver(() => map.resize());
     observer.observe(mapNode.current);
@@ -333,7 +381,7 @@ export default function Home() {
     map.setStyle(mapStyle(base, labels, maskOpacity));
     const restoreRoutes = () => {
       clearRouteLayers(map);
-      addRouteLayers(map, latestRoutesRef.current, latestLineWidthRef.current, latestShowStopsRef.current);
+      addRouteLayers(map, latestRoutesRef.current, latestLineWidthRef.current, latestShowStopsRef.current, 1, latestStopModeRef.current, latestHiddenStopIdsRef.current, latestStopEditingRef.current);
       map.triggerRepaint();
     };
     map.once("style.load", restoreRoutes);
@@ -356,13 +404,38 @@ export default function Home() {
     if (!map) return;
     const renderRoutes = () => {
       clearRouteLayers(map);
-      addRouteLayers(map, routes, lineWidth, showStops);
+      addRouteLayers(map, routes, lineWidth, showStops, 1, stopMode, hiddenStopIds, stopEditing);
       map.triggerRepaint();
     };
     if (map.isStyleLoaded()) renderRoutes();
     else map.once("style.load", renderRoutes);
     return () => { map.off("style.load", renderRoutes); };
-  }, [routes, lineWidth, showStops]);
+  }, [routes, lineWidth, showStops, stopMode, hiddenStopIds, stopEditing]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !stopEditing || !showStops || !map.getLayer("stops-hit")) return;
+    const handleClick = (event: any) => {
+      const feature = event.features?.[0];
+      const id = String(feature?.properties?.id ?? "");
+      if (!id) return;
+      const name = String(feature.properties?.name ?? "该站点");
+      const isHidden = latestHiddenStopIdsRef.current.includes(id);
+      setHiddenStopIds((current) => isHidden ? current.filter((item) => item !== id) : [...current, id]);
+      setNotice(isHidden ? `${name} 已恢复显示` : `${name} 已隐藏；再次点击淡色站点可恢复`);
+    };
+    const handleEnter = () => { map.getCanvas().style.cursor = "pointer"; };
+    const handleLeave = () => { map.getCanvas().style.cursor = ""; };
+    map.on("click", "stops-hit", handleClick);
+    map.on("mouseenter", "stops-hit", handleEnter);
+    map.on("mouseleave", "stops-hit", handleLeave);
+    return () => {
+      map.off("click", "stops-hit", handleClick);
+      map.off("mouseenter", "stops-hit", handleEnter);
+      map.off("mouseleave", "stops-hit", handleLeave);
+      map.getCanvas().style.cursor = "";
+    };
+  }, [stopEditing, showStops, stopMode, routes]);
 
   const fitRoutes = useCallback((nextRoutes: TransitRoute[]) => {
     const coords = nextRoutes.filter((route) => route.status === "ready").flatMap((route) => route.path);
@@ -472,7 +545,7 @@ export default function Home() {
       await new Promise<void>((resolve, reject) => {
         const timer = window.setTimeout(() => reject(new Error("底图加载超时")), 18000);
         exportMap!.once("load", () => {
-          addRouteLayers(exportMap!, routes, lineWidth, showStops, scale);
+          addRouteLayers(exportMap!, routes, lineWidth, showStops, scale, stopMode, hiddenStopIds, false);
           exportMap!.once("idle", () => { window.clearTimeout(timer); resolve(); });
         });
       });
@@ -546,7 +619,10 @@ export default function Home() {
             <div className="settings-list">
               <label><div><strong>地名与道路标注</strong><span>可独立于底图显示</span></div><input type="checkbox" checked={labels} onChange={(event) => setLabels(event.target.checked)} /><i /></label>
               <label><div><strong>公交站点</strong><span>按线路颜色描边</span></div><input type="checkbox" checked={showStops} onChange={(event) => setShowStops(event.target.checked)} /><i /></label>
+              <label><div><strong>仅显示首末站</strong><span>每条线路只保留起点和终点</span></div><input type="checkbox" checked={stopMode === "terminals"} onChange={(event) => setStopMode(event.target.checked ? "terminals" : "all")} /><i /></label>
+              <label><div><strong>站点隐藏编辑</strong><span>点击地图站点可隐藏或恢复</span></div><input type="checkbox" checked={stopEditing} onChange={(event) => setStopEditing(event.target.checked)} /><i /></label>
             </div>
+            {hiddenStopIds.length > 0 && <button className="restore-stops" onClick={() => { setHiddenStopIds([]); setNotice("已恢复全部隐藏站点"); }}>恢复全部隐藏站点 <span>{hiddenStopIds.length}</span></button>}
             <div className="width-setting"><div><strong>底图淡化蒙版</strong><output>{maskOpacity === 0 ? "透明" : `${Math.round(maskOpacity * 100)}%`}</output></div><input aria-label="底图淡化蒙版不透明度" type="range" min="0" max="85" step="5" value={Math.round(maskOpacity * 100)} onChange={(event) => setMaskOpacity(Number(event.target.value) / 100)} /></div>
             <div className="width-setting"><div><strong>线路宽度</strong><output>{lineWidth} px</output></div><input type="range" min="3" max="12" value={lineWidth} onChange={(event) => setLineWidth(Number(event.target.value))} /></div>
             <div className="info-note"><b>自动并行排线</b><p>多线路以相同线宽、等间距居中排列，走向重合时仍可清晰辨认。</p></div>
