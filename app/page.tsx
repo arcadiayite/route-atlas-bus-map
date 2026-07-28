@@ -26,6 +26,25 @@ type TransitRoute = {
 };
 
 type CropRect = { x: number; y: number; width: number; height: number };
+type ExportFormat = "png" | "svg";
+type MapCamera = { center: Coord; zoom: number; bearing: number; pitch: number };
+type ArchivePayload = {
+  version: 1;
+  savedAt: number;
+  city: string;
+  routes: TransitRoute[];
+  base: BaseKey;
+  labels: boolean;
+  showStops: boolean;
+  stopMode: "all" | "terminals";
+  stopEditing: boolean;
+  hiddenStopIds: string[];
+  maskOpacity: number;
+  lineWidth: number;
+  camera: MapCamera;
+};
+type ArchiveSummary = { id: string; kind: "auto" | "manual"; name: string; createdAt: number; updatedAt: number };
+type ExportStop = { id: string; name: string; coord: Coord; colors: Set<string>; terminal: boolean };
 
 declare global {
   interface Window {
@@ -323,6 +342,51 @@ function stopKey(name: string) {
   return name.trim().replace(/\s+/g, "").replace(/[（(][^）)]*[）)]/g, "");
 }
 
+function collectExportStops(routes: TransitRoute[], stopMode: "all" | "terminals", hiddenStopIds: string[]) {
+  const hiddenSet = new Set(hiddenStopIds);
+  const merged: (ExportStop & { key: string; coords: Coord[] })[] = [];
+  routes.filter((route) => route.visible && route.status === "ready").forEach((route) => {
+    const routeStops = stopMode === "terminals"
+      ? route.stops.filter((_, index) => index === 0 || index === route.stops.length - 1)
+      : route.stops;
+    routeStops.forEach((stop, index) => {
+      const key = stopKey(stop.name);
+      const terminal = stopMode === "terminals" || index === 0 || index === routeStops.length - 1;
+      const existing = merged.find((item) => item.key === key && stopDistanceMetres(item.coord, stop.coord) <= 80);
+      if (existing) {
+        existing.colors.add(route.color);
+        existing.coords.push(stop.coord);
+        existing.terminal ||= terminal;
+        existing.coord = [
+          existing.coords.reduce((sum, coord) => sum + coord[0], 0) / existing.coords.length,
+          existing.coords.reduce((sum, coord) => sum + coord[1], 0) / existing.coords.length,
+        ];
+      } else {
+        const id = `${key}:${Math.round(stop.coord[0] * 100)}:${Math.round(stop.coord[1] * 100)}`;
+        merged.push({ id, name: stop.name, key, coord: stop.coord, coords: [stop.coord], colors: new Set([route.color]), terminal });
+      }
+    });
+  });
+  return merged.filter((stop) => !hiddenSet.has(stop.id));
+}
+
+function escapeXml(value: string) {
+  return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" })[character] ?? character);
+}
+
+function offsetSvgPath(points: { x: number; y: number }[], offset: number) {
+  if (points.length < 2) return "";
+  const shifted = points.map((point, index) => {
+    const previous = points[Math.max(0, index - 1)];
+    const next = points[Math.min(points.length - 1, index + 1)];
+    const dx = next.x - previous.x;
+    const dy = next.y - previous.y;
+    const length = Math.hypot(dx, dy) || 1;
+    return { x: point.x + (-dy / length) * offset, y: point.y + (dx / length) * offset };
+  });
+  return shifted.map((point, index) => `${index === 0 ? "M" : "L"}${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(" ");
+}
+
 function clearRouteLayers(map: MapLibreMap) {
   const style = map.getStyle();
   [...(style.layers ?? [])].reverse().forEach((layer) => {
@@ -467,12 +531,20 @@ export default function Home() {
   const [hiddenStopIds, setHiddenStopIds] = useState<string[]>([]);
   const [maskOpacity, setMaskOpacity] = useState(0);
   const [lineWidth, setLineWidth] = useState(6);
-  const [panel, setPanel] = useState<"routes" | "layers" | "export">("routes");
+  const [panel, setPanel] = useState<"routes" | "layers" | "export" | "archive">("routes");
   const [cropMode, setCropMode] = useState(false);
   const [crop, setCrop] = useState<CropRect | null>(null);
   const [scale, setScale] = useState(2);
+  const [exportFormat, setExportFormat] = useState<ExportFormat>("png");
   const [notice, setNotice] = useState("输入一条或多条线路开始制图");
   const [exporting, setExporting] = useState(false);
+  const [camera, setCamera] = useState<MapCamera>({ center: [113.5767, 22.2707], zoom: 11.7, bearing: 0, pitch: 0 });
+  const [archives, setArchives] = useState<ArchiveSummary[]>([]);
+  const [archiveName, setArchiveName] = useState("");
+  const [archiveReady, setArchiveReady] = useState(false);
+  const [archiveBusy, setArchiveBusy] = useState(false);
+  const [autoSaveEnabled, setAutoSaveEnabled] = useState(true);
+  const [autoSaveStatus, setAutoSaveStatus] = useState("正在读取存档…");
   const latestRoutesRef = useRef(routes);
   const latestLineWidthRef = useRef(lineWidth);
   const latestShowStopsRef = useRef(showStops);
@@ -481,6 +553,7 @@ export default function Home() {
   const latestHiddenStopIdsRef = useRef(hiddenStopIds);
   const styleKeyRef = useRef(`${base}:${labels}`);
   const fitAfterLoadRef = useRef(false);
+  const pendingCameraRef = useRef<MapCamera | null>(null);
 
   latestRoutesRef.current = routes;
   latestLineWidthRef.current = lineWidth;
@@ -490,7 +563,172 @@ export default function Home() {
   latestHiddenStopIdsRef.current = hiddenStopIds;
 
   const readyRoutes = useMemo(() => routes.filter((route) => route.status === "ready"), [routes]);
+  const manualArchives = useMemo(() => archives.filter((archive) => archive.kind === "manual"), [archives]);
+  const autoArchive = useMemo(() => archives.find((archive) => archive.kind === "auto"), [archives]);
 
+  const buildArchivePayload = useCallback((): ArchivePayload => ({
+    version: 1,
+    savedAt: Date.now(),
+    city,
+    routes: routes.filter((route) => route.status === "ready"),
+    base,
+    labels,
+    showStops,
+    stopMode,
+    stopEditing,
+    hiddenStopIds,
+    maskOpacity,
+    lineWidth,
+    camera,
+  }), [city, routes, base, labels, showStops, stopMode, stopEditing, hiddenStopIds, maskOpacity, lineWidth, camera]);
+
+  const applyArchivePayload = useCallback((payload: ArchivePayload) => {
+    if (!payload || payload.version !== 1 || !Array.isArray(payload.routes)) throw new Error("存档格式不受支持");
+    setCity(payload.city || "珠海市");
+    setRoutes(payload.routes.map((route) => ({ ...route, status: "ready" })));
+    if (payload.base && BASES[payload.base]) setBase(payload.base);
+    setLabels(Boolean(payload.labels));
+    setShowStops(Boolean(payload.showStops));
+    setStopMode(payload.stopMode === "terminals" ? "terminals" : "all");
+    setStopEditing(Boolean(payload.stopEditing));
+    setHiddenStopIds(Array.isArray(payload.hiddenStopIds) ? payload.hiddenStopIds : []);
+    setMaskOpacity(Number.isFinite(payload.maskOpacity) ? payload.maskOpacity : 0);
+    setLineWidth(Number.isFinite(payload.lineWidth) ? payload.lineWidth : 6);
+    setCrop(null);
+    if (payload.camera) {
+      setCamera(payload.camera);
+      pendingCameraRef.current = payload.camera;
+      mapRef.current?.jumpTo({ center: payload.camera.center, zoom: payload.camera.zoom, bearing: payload.camera.bearing, pitch: payload.camera.pitch });
+    }
+  }, []);
+
+  const refreshArchives = useCallback(async () => {
+    const response = await fetch("/api/archives", { cache: "no-store" });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "无法读取存档列表");
+    setArchives(data.archives ?? []);
+    return data.archives as ArchiveSummary[];
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const rows = await refreshArchives();
+        const automatic = rows.find((archive) => archive.kind === "auto");
+        if (automatic) {
+          const response = await fetch(`/api/archives?id=${encodeURIComponent(automatic.id)}`, { cache: "no-store" });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || "无法读取自动存档");
+          if (!cancelled) {
+            applyArchivePayload(JSON.parse(data.archive.payload));
+            setNotice("已恢复上次自动存档");
+            setAutoSaveStatus(`已恢复 · ${new Date(automatic.updatedAt).toLocaleString("zh-CN", { hour12: false })}`);
+          }
+        } else if (!cancelled) {
+          setAutoSaveStatus("尚无自动存档");
+        }
+      } catch (error) {
+        if (!cancelled) setAutoSaveStatus(error instanceof Error ? `存档读取失败：${error.message}` : "存档读取失败");
+      } finally {
+        if (!cancelled) setArchiveReady(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [applyArchivePayload, refreshArchives]);
+
+  useEffect(() => {
+    if (!archiveReady || !autoSaveEnabled) return;
+    const timer = window.setTimeout(() => {
+      setAutoSaveStatus("正在自动保存…");
+      void fetch("/api/archives", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: "auto", payload: buildArchivePayload() }),
+      }).then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "自动保存失败");
+        const saved = data.archive as ArchiveSummary;
+        setArchives((current) => [saved, ...current.filter((archive) => archive.kind !== "auto")]);
+        setAutoSaveStatus(`已自动保存 · ${new Date(saved.updatedAt).toLocaleTimeString("zh-CN", { hour12: false })}`);
+      }).catch((error) => setAutoSaveStatus(error instanceof Error ? `自动保存失败：${error.message}` : "自动保存失败"));
+    }, 1400);
+    return () => window.clearTimeout(timer);
+  }, [archiveReady, autoSaveEnabled, buildArchivePayload]);
+
+  async function saveAutoArchive() {
+    setArchiveBusy(true);
+    setAutoSaveStatus("正在保存…");
+    try {
+      const response = await fetch("/api/archives", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: "auto", payload: buildArchivePayload() }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "保存失败");
+      await refreshArchives();
+      setAutoSaveStatus(`已保存 · ${new Date(data.archive.updatedAt).toLocaleString("zh-CN", { hour12: false })}`);
+      setNotice("当前画布已写入自动存档");
+    } catch (error) {
+      setAutoSaveStatus(error instanceof Error ? `保存失败：${error.message}` : "保存失败");
+    } finally {
+      setArchiveBusy(false);
+    }
+  }
+
+  async function saveManualArchive() {
+    setArchiveBusy(true);
+    try {
+      const fallbackName = `线路图 ${new Date().toLocaleString("zh-CN", { hour12: false })}`;
+      const response = await fetch("/api/archives", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: "manual", name: archiveName.trim() || fallbackName, payload: buildArchivePayload() }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "手动存档失败");
+      setArchiveName("");
+      await refreshArchives();
+      setNotice(`${data.archive.name} 已保存`);
+    } catch (error) {
+      setNotice(error instanceof Error ? `存档失败：${error.message}` : "存档失败");
+    } finally {
+      setArchiveBusy(false);
+    }
+  }
+
+  async function restoreArchive(id: string, name: string) {
+    if (!window.confirm(`载入“${name}”会替换当前画布，是否继续？`)) return;
+    setArchiveBusy(true);
+    try {
+      const response = await fetch(`/api/archives?id=${encodeURIComponent(id)}`, { cache: "no-store" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "载入存档失败");
+      applyArchivePayload(JSON.parse(data.archive.payload));
+      setNotice(`${name} 已载入画布`);
+    } catch (error) {
+      setNotice(error instanceof Error ? `载入失败：${error.message}` : "载入失败");
+    } finally {
+      setArchiveBusy(false);
+    }
+  }
+
+  async function deleteArchive(id: string, name: string) {
+    if (!window.confirm(`确认删除手动存档“${name}”？此操作无法撤销。`)) return;
+    setArchiveBusy(true);
+    try {
+      const response = await fetch(`/api/archives?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "删除失败");
+      await refreshArchives();
+      setNotice(`${name} 已删除`);
+    } catch (error) {
+      setNotice(error instanceof Error ? `删除失败：${error.message}` : "删除失败");
+    } finally {
+      setArchiveBusy(false);
+    }
+  }
 
   useEffect(() => {
     if (!mapNode.current || mapRef.current) return;
@@ -498,8 +736,10 @@ export default function Home() {
     const map = new maplibregl.Map({
       container: mapNode.current,
       style: mapStyle(base, labels, maskOpacity),
-      center: [113.5767, 22.2707],
-      zoom: 11.7,
+      center: camera.center,
+      zoom: camera.zoom,
+      bearing: camera.bearing,
+      pitch: camera.pitch,
       minZoom: 3,
       maxZoom: 19,
       preserveDrawingBuffer: true,
@@ -508,14 +748,27 @@ export default function Home() {
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
     map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-right");
     mapRef.current = map;
+    const syncCamera = () => {
+      const center = map.getCenter();
+      setCamera({ center: [center.lng, center.lat], zoom: map.getZoom(), bearing: map.getBearing(), pitch: map.getPitch() });
+    };
+    map.on("moveend", syncCamera);
     map.on("error", (event) => console.error("MAP_RENDER_ERROR", event.error?.message ?? event));
     map.once("style.load", () => {
       clearRouteLayers(map);
       addRouteLayers(map, latestRoutesRef.current, latestLineWidthRef.current, latestShowStopsRef.current, 1, latestStopModeRef.current, latestHiddenStopIdsRef.current, latestStopEditingRef.current);
     });
+    map.once("load", () => {
+      if (pendingCameraRef.current) {
+        const saved = pendingCameraRef.current;
+        map.jumpTo({ center: saved.center, zoom: saved.zoom, bearing: saved.bearing, pitch: saved.pitch });
+        pendingCameraRef.current = null;
+      }
+      syncCamera();
+    });
     const observer = new ResizeObserver(() => map.resize());
     observer.observe(mapNode.current);
-    return () => { observer.disconnect(); map.remove(); mapRef.current = null; };
+    return () => { observer.disconnect(); map.off("moveend", syncCamera); map.remove(); mapRef.current = null; };
   }, []);
 
   useEffect(() => {
@@ -812,6 +1065,82 @@ export default function Home() {
     }
   }
 
+  async function exportSvg() {
+    const map = mapRef.current;
+    if (!map || exporting) return;
+    setExporting(true);
+    setNotice("正在生成可编辑 SVG…");
+    const canvas = map.getCanvas();
+    const area = crop && crop.width > 20 && crop.height > 20 ? crop : { x: 0, y: 0, width: canvas.clientWidth, height: canvas.clientHeight };
+    const nw = map.unproject([area.x, area.y]);
+    const se = map.unproject([area.x + area.width, area.y + area.height]);
+    const width = Math.min(8192, Math.max(640, Math.round(area.width * scale)));
+    const height = Math.min(8192, Math.max(480, Math.round(area.height * scale)));
+    const renderScale = width / area.width;
+    const node = document.createElement("div");
+    node.style.cssText = `position:fixed;left:-12000px;top:0;width:${width}px;height:${height}px;`;
+    document.body.appendChild(node);
+    let exportMap: MapLibreMap | null = null;
+    try {
+      exportMap = new maplibregl.Map({
+        container: node,
+        style: mapStyle(base, labels, maskOpacity),
+        bounds: [[nw.lng, se.lat], [se.lng, nw.lat]],
+        fitBoundsOptions: { padding: 0 },
+        interactive: false,
+        attributionControl: false,
+        preserveDrawingBuffer: true,
+        fadeDuration: 0,
+      });
+      await new Promise<void>((resolve, reject) => {
+        const timer = window.setTimeout(() => reject(new Error("底图加载超时")), 18000);
+        exportMap!.once("load", () => exportMap!.once("idle", () => { window.clearTimeout(timer); resolve(); }));
+      });
+
+      const background = exportMap.getCanvas().toDataURL("image/png");
+      const collections = segmentCollections(routes, lineWidth, renderScale);
+      const activeRoutes = routes.filter((route) => route.visible && route.status === "ready");
+      const routeMarkup = activeRoutes.map((route, routeIndex) => {
+        const features = collections.get(route.id) ?? [];
+        const paths = features.map((feature, featureIndex) => {
+          const points = (feature.geometry.coordinates as Coord[]).map((coord) => exportMap!.project(coord));
+          const d = offsetSvgPath(points, Number(feature.properties.offset) || 0);
+          if (!d) return "";
+          const dash = route.dash ? ` stroke-dasharray="${(lineWidth * renderScale * 1.8).toFixed(2)} ${(lineWidth * renderScale * 1.35).toFixed(2)}"` : "";
+          return `<g id="route-${routeIndex + 1}-part-${featureIndex + 1}"><path d="${d}" fill="none" stroke="#ffffff" stroke-opacity="0.92" stroke-width="${(lineWidth * renderScale + 3 * renderScale).toFixed(2)}" stroke-linecap="round" stroke-linejoin="bevel"/><path d="${d}" fill="none" stroke="${escapeXml(route.color)}" stroke-width="${(lineWidth * renderScale).toFixed(2)}" stroke-linecap="round" stroke-linejoin="bevel"${dash}/></g>`;
+        }).join("");
+        return `<g id="route-${routeIndex + 1}" data-route-id="${escapeXml(route.id)}" data-route-name="${escapeXml(route.name)}"><title>${escapeXml(route.name)}</title>${paths}</g>`;
+      }).join("");
+
+      const stationMarkup = showStops ? collectExportStops(routes, stopMode, hiddenStopIds).map((stop, index) => {
+        const point = exportMap!.project(stop.coord);
+        const radius = ((stop.terminal ? 4.5 : 3.5) + Math.min(3, stop.colors.size - 1) * 2) * renderScale;
+        const stroke = stop.colors.size > 1 ? "#18252d" : [...stop.colors][0];
+        return `<g id="station-${index + 1}" data-station-id="${escapeXml(stop.id)}" data-station-name="${escapeXml(stop.name)}"><title>${escapeXml(stop.name)}</title><circle cx="${point.x.toFixed(2)}" cy="${point.y.toFixed(2)}" r="${radius.toFixed(2)}" fill="#ffffff" stroke="${escapeXml(stroke)}" stroke-width="${(2 * renderScale).toFixed(2)}"/></g>`;
+      }).join("") : "";
+
+      const svg = `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeXml(city)}公交线路图"><title>${escapeXml(city)}公交线路图</title><metadata>由路绘导出；线路和站点均为独立矢量分组。</metadata><g id="basemap"><image href="${background}" x="0" y="0" width="${width}" height="${height}"/></g><g id="routes">${routeMarkup}</g><g id="stations">${stationMarkup}</g></svg>`;
+      const blob = new Blob([svg], { type: "image/svg+xml;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `公交线路图-${city}-${new Date().toISOString().slice(0, 10)}-${scale}x.svg`;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setNotice(`已导出 ${width} × ${height} SVG；线路与站点可独立编辑`);
+    } catch (error) {
+      setNotice(error instanceof Error ? `SVG 导出失败：${error.message}` : "SVG 导出失败");
+    } finally {
+      exportMap?.remove();
+      node.remove();
+      setExporting(false);
+    }
+  }
+
+  function exportCurrent() {
+    return exportFormat === "svg" ? exportSvg() : exportPng();
+  }
+
   return (
     <main className={`studio ${BASES[base].dark ? "map-is-dark" : ""}`}>
       <aside className="sidebar">
@@ -825,6 +1154,7 @@ export default function Home() {
           <button className={panel === "routes" ? "active" : ""} onClick={() => setPanel("routes")}><span>01</span>线路</button>
           <button className={panel === "layers" ? "active" : ""} onClick={() => setPanel("layers")}><span>02</span>底图</button>
           <button className={panel === "export" ? "active" : ""} onClick={() => setPanel("export")}><span>03</span>导出</button>
+          <button className={panel === "archive" ? "active" : ""} onClick={() => setPanel("archive")}><span>04</span>存档</button>
         </nav>
 
         <div className="panel-scroll">
@@ -907,15 +1237,44 @@ export default function Home() {
           </section>}
 
           {panel === "export" && <section className="panel-section">
-            <div className="section-heading"><div><p className="eyebrow">HIGH-RES EXPORT</p><h2>导出高清 PNG</h2></div></div>
+            <div className="section-heading"><div><p className="eyebrow">HIGH-RES EXPORT</p><h2>导出高清线路图</h2></div></div>
+            <div className="format-options" role="group" aria-label="导出格式">
+              <button className={exportFormat === "png" ? "active" : ""} onClick={() => setExportFormat("png")}><strong>PNG</strong><span>通用高清图片</span></button>
+              <button className={exportFormat === "svg" ? "active" : ""} onClick={() => setExportFormat("svg")}><strong>SVG</strong><span>线路与站点可编辑</span></button>
+            </div>
             <button className={`range-button ${crop ? "has-range" : ""}`} onClick={() => { setCropMode(true); setNotice("在地图上拖动框选导出范围"); }}>
               <span className="crop-icon" />
               <div><strong>{crop ? "重新选择导出范围" : "框选导出范围"}</strong><small>{crop ? `${Math.round(crop.width)} × ${Math.round(crop.height)} 画布像素` : "在地图上自由拖出矩形"}</small></div><b>→</b>
             </button>
             <div className="export-setting"><strong>清晰度倍率</strong><div className="scale-options">{[1, 2, 4].map((item) => <button className={scale === item ? "active" : ""} onClick={() => setScale(item)} key={item}>{item}×<small>{item === 1 ? "屏幕" : item === 2 ? "高清" : "印刷"}</small></button>)}</div></div>
-            <div className="export-summary"><div><span>输出格式</span><strong>PNG</strong></div><div><span>底图风格</span><strong>{BASES[base].name}</strong></div><div><span>线路数量</span><strong>{readyRoutes.length}</strong></div><div><span>最大边长</span><strong>8192 px</strong></div></div>
-            <button className="primary export-button" disabled={exporting} onClick={() => void exportPng()}>{exporting ? "正在渲染高清地图…" : `导出 ${scale}× PNG`}</button>
-            <p className="privacy-note">导出在本机浏览器内完成，不上传线路图。</p>
+            <div className="export-summary"><div><span>输出格式</span><strong>{exportFormat.toUpperCase()}</strong></div><div><span>底图风格</span><strong>{BASES[base].name}</strong></div><div><span>线路数量</span><strong>{readyRoutes.length}</strong></div><div><span>{exportFormat === "svg" ? "矢量结构" : "最大边长"}</span><strong>{exportFormat === "svg" ? "独立元素" : "8192 px"}</strong></div></div>
+            <button className="primary export-button" disabled={exporting} onClick={() => void exportCurrent()}>{exporting ? (exportFormat === "svg" ? "正在生成可编辑 SVG…" : "正在渲染高清地图…") : `导出 ${scale}× ${exportFormat.toUpperCase()}`}</button>
+            <p className="privacy-note">{exportFormat === "svg" ? "底图以影像嵌入；每条线路和每个站点均为独立矢量分组。" : "导出在本机浏览器内完成，不上传线路图。"}</p>
+          </section>}
+
+          {panel === "archive" && <section className="panel-section">
+            <div className="section-heading"><div><p className="eyebrow">SAVE & RESTORE</p><h2>画布存档</h2></div><span>{manualArchives.length} 个</span></div>
+            <div className="archive-auto">
+              <div className="archive-auto-head"><div><strong>自动存档</strong><span>画布修改后约 1.4 秒自动保存</span></div><label className="mini-switch"><input type="checkbox" checked={autoSaveEnabled} onChange={(event) => setAutoSaveEnabled(event.target.checked)} /><i /></label></div>
+              <p>{autoSaveEnabled ? autoSaveStatus : "自动存档已暂停"}</p>
+              <button type="button" disabled={archiveBusy} onClick={() => void saveAutoArchive()}>立即保存当前画布</button>
+            </div>
+
+            <div className="manual-save">
+              <label>新建手动存档<input value={archiveName} onChange={(event) => setArchiveName(event.target.value)} placeholder="输入存档名称（可留空）" aria-label="手动存档名称" /></label>
+              <button className="primary" type="button" disabled={archiveBusy} onClick={() => void saveManualArchive()}>保存为新版本</button>
+            </div>
+
+            <div className="archive-list">
+              <div className="archive-list-title"><strong>手动存档</strong><span>载入会替换当前画布</span></div>
+              {manualArchives.length === 0 && <div className="archive-empty">尚无手动存档。保存重要节点后，可随时回到该版本。</div>}
+              {manualArchives.map((archive) => <article className="archive-card" key={archive.id}>
+                <div><strong>{archive.name}</strong><span>{new Date(archive.updatedAt).toLocaleString("zh-CN", { hour12: false })}</span></div>
+                <button type="button" disabled={archiveBusy} onClick={() => void restoreArchive(archive.id, archive.name)}>载入</button>
+                <button className="danger" type="button" disabled={archiveBusy} onClick={() => void deleteArchive(archive.id, archive.name)}>删除</button>
+              </article>)}
+            </div>
+            {autoArchive && <p className="archive-footnote">最近自动存档：{new Date(autoArchive.updatedAt).toLocaleString("zh-CN", { hour12: false })}</p>}
           </section>}
         </div>
 

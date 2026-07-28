@@ -9,17 +9,17 @@ export async function generateMetadata(): Promise<Metadata> {
   const origin = `${protocol}://${host}`;
   return {
     title: "路绘 · 公交线路可视化制图台",
-    description: "基于高德公交数据的多线路并行排线、底图切换与高清 PNG 导出工具。",
+    description: "基于高德公交数据的多线路并行排线、PNG/SVG 导出与云端存档工具。",
     openGraph: {
       title: "路绘 · 公交线路可视化制图台",
-      description: "多线路并行排线、卫星底图与高清范围导出。",
+      description: "多线路并行排线、卫星底图、可编辑 SVG 导出与云端存档。",
       images: [{ url: `${origin}/og.png`, width: 1734, height: 907, alt: "路绘公交线路可视化制图台" }],
       type: "website",
     },
     twitter: {
       card: "summary_large_image",
       title: "路绘 · 公交线路可视化制图台",
-      description: "多线路并行排线、卫星底图与高清范围导出。",
+      description: "多线路并行排线、卫星底图、可编辑 SVG 导出与云端存档。",
       images: [`${origin}/og.png`],
     },
   };
