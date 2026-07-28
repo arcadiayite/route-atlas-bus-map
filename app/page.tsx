@@ -7,6 +7,7 @@ import type { Map as MapLibreMap, StyleSpecification } from "maplibre-gl";
 type Coord = [number, number];
 type BaseKey = "paper" | "atlas" | "dark" | "satellite";
 type RouteStatus = "searching" | "ready" | "error";
+type CustomNode = { id: string; kind: "stop" | "via"; value: string };
 
 type TransitRoute = {
   id: string;
@@ -20,6 +21,7 @@ type TransitRoute = {
   path: Coord[];
   stops: { name: string; coord: Coord }[];
   status: RouteStatus;
+  custom?: boolean;
   error?: string;
 };
 
@@ -126,17 +128,22 @@ function gcjToWgs([lng, lat]: Coord): Coord {
   return [lng * 2 - (lng + dLng), lat * 2 - (lat + dLat)];
 }
 
-function readLngLat(value: any): Coord | null {
+function readGcjLngLat(value: any): Coord | null {
   if (!value) return null;
   const lng = typeof value.getLng === "function" ? value.getLng() : value.lng ?? value[0];
   const lat = typeof value.getLat === "function" ? value.getLat() : value.lat ?? value[1];
-  return Number.isFinite(Number(lng)) && Number.isFinite(Number(lat)) ? gcjToWgs([Number(lng), Number(lat)]) : null;
+  return Number.isFinite(Number(lng)) && Number.isFinite(Number(lat)) ? [Number(lng), Number(lat)] : null;
+}
+
+function readLngLat(value: any): Coord | null {
+  const coord = readGcjLngLat(value);
+  return coord ? gcjToWgs(coord) : null;
 }
 
 let amapPromise: Promise<any> | null = null;
 function loadAmap() {
   if (typeof window === "undefined") return Promise.reject(new Error("仅支持浏览器调用"));
-  if (window.AMap?.LineSearch) return Promise.resolve(window.AMap);
+  if (window.AMap?.LineSearch && window.AMap?.Geocoder && window.AMap?.Driving) return Promise.resolve(window.AMap);
   if (amapPromise) return amapPromise;
   const key = document.body.dataset.amapKey;
   const securityJsCode = document.body.dataset.amapSecurityCode;
@@ -144,7 +151,7 @@ function loadAmap() {
   window._AMapSecurityConfig = { securityJsCode };
   amapPromise = new Promise((resolve, reject) => {
     const script = document.createElement("script");
-    script.src = `https://webapi.amap.com/maps?v=2.0&key=${encodeURIComponent(key)}&plugin=AMap.LineSearch`;
+    script.src = `https://webapi.amap.com/maps?v=2.0&key=${encodeURIComponent(key)}&plugin=AMap.LineSearch,AMap.Geocoder,AMap.Driving`;
     script.async = true;
     script.onload = () => window.AMap ? resolve(window.AMap) : reject(new Error("高德服务未能加载"));
     script.onerror = () => reject(new Error("无法连接高德服务"));
@@ -445,6 +452,12 @@ export default function Home() {
   const dragStart = useRef<{ x: number; y: number } | null>(null);
   const [city, setCity] = useState("珠海市");
   const [query, setQuery] = useState("");
+  const [routeEntryMode, setRouteEntryMode] = useState<"existing" | "custom">("existing");
+  const [customName, setCustomName] = useState("");
+  const [customStart, setCustomStart] = useState("");
+  const [customEnd, setCustomEnd] = useState("");
+  const [customNodes, setCustomNodes] = useState<CustomNode[]>([]);
+  const [planningCustom, setPlanningCustom] = useState(false);
   const [routes, setRoutes] = useState<TransitRoute[]>([]);
   const [base, setBase] = useState<BaseKey>("paper");
   const [labels, setLabels] = useState(true);
@@ -627,6 +640,105 @@ export default function Home() {
     terms.forEach((term, index) => void searchOne(term, index));
   }
 
+  function addCustomNode(kind: CustomNode["kind"]) {
+    setCustomNodes((current) => [...current, { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, kind, value: "" }]);
+  }
+
+  function updateCustomNode(id: string, patch: Partial<CustomNode>) {
+    setCustomNodes((current) => current.map((node) => node.id === id ? { ...node, ...patch } : node));
+  }
+
+  async function submitCustomRoute(event: FormEvent) {
+    event.preventDefault();
+    const start = customStart.trim();
+    const end = customEnd.trim();
+    const nodes = customNodes.map((node) => ({ ...node, value: node.value.trim() }));
+    if (!start || !end || nodes.some((node) => !node.value)) {
+      setNotice("请填写首站、末站以及每一个中途节点");
+      return;
+    }
+
+    const id = `custom-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const routeName = customName.trim() || `${start}—${end}`;
+    const pending: TransitRoute = {
+      id,
+      query: routeName,
+      name: routeName,
+      from: start,
+      to: end,
+      color: PALETTE[routes.length % PALETTE.length],
+      dash: false,
+      visible: true,
+      path: [],
+      stops: [],
+      status: "searching",
+      custom: true,
+    };
+    setPlanningCustom(true);
+    setRoutes((current) => [...current, pending]);
+    setNotice(`正在为 ${routeName} 规划路径…`);
+
+    try {
+      const AMap = await loadAmap();
+      const geocoder = new AMap.Geocoder({ city, extensions: "base" });
+      const ordered = [
+        { kind: "stop" as const, value: start },
+        ...nodes,
+        { kind: "stop" as const, value: end },
+      ];
+      const geocoded: { kind: CustomNode["kind"]; name: string; gcj: Coord; coord: Coord }[] = [];
+
+      for (const node of ordered) {
+        const result: any = await new Promise((resolve, reject) => {
+          geocoder.getLocation(node.value, (status: string, data: any) => status === "complete" && data?.info === "OK"
+            ? resolve(data)
+            : reject(new Error(`无法定位“${node.value}”`)));
+        });
+        const gcj = readGcjLngLat(result?.geocodes?.[0]?.location);
+        if (!gcj) throw new Error(`“${node.value}”没有返回有效坐标`);
+        geocoded.push({ kind: node.kind, name: node.value, gcj, coord: gcjToWgs(gcj) });
+      }
+
+      const path: Coord[] = [];
+      for (let index = 0; index < geocoded.length - 1; index += 1) {
+        const origin = geocoded[index];
+        const destination = geocoded[index + 1];
+        const result: any = await new Promise((resolve, reject) => {
+          const driving = new AMap.Driving({ city, policy: 0, extensions: "all" });
+          driving.search(
+            new AMap.LngLat(origin.gcj[0], origin.gcj[1]),
+            new AMap.LngLat(destination.gcj[0], destination.gcj[1]),
+            (status: string, data: any) => status === "complete"
+              ? resolve(data)
+              : reject(new Error(`${origin.name} → ${destination.name} 规划失败：${data?.info || status}`)),
+          );
+        });
+        const route = result?.routes?.[0];
+        const rawLeg = (route?.steps ?? []).flatMap((step: any) => step?.path ?? []);
+        const leg = (rawLeg.length ? rawLeg : route?.path ?? []).map(readLngLat).filter(Boolean) as Coord[];
+        if (leg.length < 2) throw new Error(`${origin.name} → ${destination.name} 未返回可绘制路径`);
+        if (path.length && Math.hypot(path.at(-1)![0] - leg[0][0], path.at(-1)![1] - leg[0][1]) < 1e-7) leg.shift();
+        path.push(...leg);
+      }
+
+      const stops = geocoded.filter((node) => node.kind === "stop").map((node) => ({ name: node.name, coord: node.coord }));
+      const ready: TransitRoute = { ...pending, path, stops, status: "ready" };
+      fitAfterLoadRef.current = true;
+      setRoutes((current) => current.map((route) => route.id === id ? ready : route));
+      setCustomName("");
+      setCustomStart("");
+      setCustomEnd("");
+      setCustomNodes([]);
+      setNotice(`${routeName} 已按高德导航加入画布`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "自定义线路规划失败";
+      setRoutes((current) => current.map((route) => route.id === id ? { ...route, status: "error", error: message } : route));
+      setNotice(message);
+    } finally {
+      setPlanningCustom(false);
+    }
+  }
+
   function updateRoute(id: string, patch: Partial<TransitRoute>) {
     setRoutes((current) => current.map((route) => route.id === id ? { ...route, ...patch } : route));
   }
@@ -717,12 +829,45 @@ export default function Home() {
 
         <div className="panel-scroll">
           {panel === "routes" && <section className="panel-section">
-            <div className="section-heading"><div><p className="eyebrow">LINE INPUT</p><h2>添加既有线路</h2></div><span>{readyRoutes.length} 条</span></div>
-            <form className="route-form" onSubmit={submitRoutes}>
+            <div className="section-heading"><div><p className="eyebrow">LINE INPUT</p><h2>添加线路</h2></div><span>{readyRoutes.length} 条</span></div>
+            <div className="route-mode-tabs" role="tablist" aria-label="线路添加方式">
+              <button type="button" className={routeEntryMode === "existing" ? "active" : ""} onClick={() => setRouteEntryMode("existing")}>既有公交</button>
+              <button type="button" className={routeEntryMode === "custom" ? "active" : ""} onClick={() => setRouteEntryMode("custom")}>自定义线路</button>
+            </div>
+
+            {routeEntryMode === "existing" && <form className="route-form" onSubmit={submitRoutes}>
               <label>查询城市<input value={city} onChange={(event) => setCity(event.target.value)} placeholder="如：珠海市" aria-label="查询城市" /></label>
               <label>线路名称<textarea value={query} onChange={(event) => setQuery(event.target.value)} placeholder="输入 10A、K2、B9，可一次添加多条" rows={3} aria-label="公交线路名称" /></label>
               <button className="primary" type="submit" disabled={!query.trim()}><span>＋</span> 从高德加入画布</button>
-            </form>
+            </form>}
+
+            {routeEntryMode === "custom" && <form className="custom-route-form" onSubmit={submitCustomRoute}>
+              <div className="custom-grid">
+                <label className="full">查询城市<input value={city} onChange={(event) => setCity(event.target.value)} placeholder="如：珠海市" aria-label="自定义线路查询城市" /></label>
+                <label className="full">线路名称（可选）<input value={customName} onChange={(event) => setCustomName(event.target.value)} placeholder="如：环城观光线" aria-label="自定义线路名称" /></label>
+                <label><span className="node-label"><i className="terminal">起</i>首站</span><input value={customStart} onChange={(event) => setCustomStart(event.target.value)} placeholder="输入地点或站名" aria-label="自定义线路首站" /></label>
+                <label><span className="node-label"><i className="terminal">终</i>末站</span><input value={customEnd} onChange={(event) => setCustomEnd(event.target.value)} placeholder="输入地点或站名" aria-label="自定义线路末站" /></label>
+              </div>
+
+              {customNodes.length > 0 && <div className="custom-node-list" aria-label="按顺序排列的中途节点">
+                {customNodes.map((node, index) => <div className="custom-node-row" key={node.id}>
+                  <b>{String(index + 1).padStart(2, "0")}</b>
+                  <select value={node.kind} onChange={(event) => updateCustomNode(node.id, { kind: event.target.value as CustomNode["kind"] })} aria-label={`第 ${index + 1} 个节点类型`}>
+                    <option value="stop">中途停站</option>
+                    <option value="via">途经点</option>
+                  </select>
+                  <input value={node.value} onChange={(event) => updateCustomNode(node.id, { value: event.target.value })} placeholder={node.kind === "stop" ? "显示站点标记" : "只约束路径"} aria-label={`第 ${index + 1} 个节点名称`} />
+                  <button type="button" onClick={() => setCustomNodes((current) => current.filter((item) => item.id !== node.id))} aria-label={`删除第 ${index + 1} 个节点`}>×</button>
+                </div>)}
+              </div>}
+
+              <div className="custom-node-actions">
+                <button type="button" onClick={() => addCustomNode("stop")}><span>＋</span> 中途停站</button>
+                <button type="button" onClick={() => addCustomNode("via")}><span>＋</span> 途经点</button>
+              </div>
+              <p className="builder-note">节点按列表顺序经过；中途停站显示站标，途经点只控制走向。</p>
+              <button className="primary" type="submit" disabled={planningCustom || !customStart.trim() || !customEnd.trim()}><span>⌁</span>{planningCustom ? "正在规划高德导航…" : "规划并加入画布"}</button>
+            </form>}
 
             <div className="route-stack">
               {routes.length === 0 && <div className="empty-card"><div className="mini-map"><i /><i /><i /></div><h3>画布还是空的</h3><p>输入本地公交线路名称，高德将返回走向与站点。</p></div>}
@@ -730,7 +875,7 @@ export default function Home() {
                 <div className="route-card-top">
                   <button className={`eye ${route.visible ? "on" : ""}`} onClick={() => updateRoute(route.id, { visible: !route.visible })} aria-label={route.visible ? "隐藏线路" : "显示线路"}>●</button>
                   <div className="route-index">{String(index + 1).padStart(2, "0")}</div>
-                  <div className="route-title"><strong>{route.name}</strong><span>{route.status === "searching" ? "正在查询高德…" : route.status === "error" ? route.error : `${route.from} → ${route.to}`}</span></div>
+                  <div className="route-title"><strong>{route.name}{route.custom && <em>自定义</em>}</strong><span>{route.status === "searching" ? (route.custom ? "正在规划高德导航…" : "正在查询高德…") : route.status === "error" ? route.error : `${route.from} → ${route.to}`}</span></div>
                   <button className="remove" onClick={() => removeRoute(route.id)} aria-label={`删除 ${route.name}`}>×</button>
                 </div>
                 {route.status === "ready" && <div className="route-tools">
