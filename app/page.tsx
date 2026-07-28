@@ -144,7 +144,7 @@ function loadAmap() {
   return amapPromise;
 }
 
-function segmentCollections(routes: TransitRoute[], width: number) {
+function segmentCollections(routes: TransitRoute[], width: number, scale = 1) {
   const active = routes.filter((route) => route.visible && route.status === "ready");
   const center = (active.length - 1) / 2;
   return new Map(active.map((route, index) => {
@@ -156,10 +156,21 @@ function segmentCollections(routes: TransitRoute[], width: number) {
     const coordinates = reverse ? [...route.path].reverse() : route.path;
     return [route.id, [{
       type: "Feature",
-      properties: { offset: (index - center) * (width + 4) },
+      properties: { offset: (index - center) * (width + 2) * scale },
       geometry: { type: "LineString", coordinates },
     }]];
   }));
+}
+
+function stopDistanceMetres(a: Coord, b: Coord) {
+  const latitude = ((a[1] + b[1]) / 2) * Math.PI / 180;
+  const dx = (a[0] - b[0]) * 111320 * Math.cos(latitude);
+  const dy = (a[1] - b[1]) * 110540;
+  return Math.hypot(dx, dy);
+}
+
+function stopKey(name: string) {
+  return name.trim().replace(/\s+/g, "").replace(/[（(][^）)]*[）)]/g, "");
 }
 
 function clearRouteLayers(map: MapLibreMap) {
@@ -173,8 +184,9 @@ function clearRouteLayers(map: MapLibreMap) {
 }
 
 function addRouteLayers(map: MapLibreMap, routes: TransitRoute[], width: number, showStops: boolean, scale = 1) {
-  const collections = segmentCollections(routes, width * scale);
-  routes.filter((route) => route.visible && route.status === "ready").forEach((route) => {
+  const activeRoutes = routes.filter((route) => route.visible && route.status === "ready");
+  const collections = segmentCollections(routes, width, scale);
+  activeRoutes.forEach((route) => {
     const features = collections.get(route.id) ?? [];
     const offsetGroups = new Map<number, any[]>();
     features.forEach((feature) => {
@@ -186,12 +198,12 @@ function addRouteLayers(map: MapLibreMap, routes: TransitRoute[], width: number,
       map.addSource(sourceId, { type: "geojson", data: { type: "FeatureCollection", features: groupFeatures } as any });
       map.addLayer({
         id: `${sourceId}-casing`, type: "line", source: sourceId,
-        layout: { "line-cap": "round", "line-join": "round" },
+        layout: { "line-cap": "round", "line-join": "bevel" },
         paint: { "line-color": "#ffffff", "line-opacity": 0.92, "line-width": width * scale + 3 * scale, "line-offset": offset },
       });
       map.addLayer({
         id: sourceId, type: "line", source: sourceId,
-        layout: { "line-cap": "round", "line-join": "round" },
+        layout: { "line-cap": "round", "line-join": "bevel" },
         paint: {
           "line-color": route.color,
           "line-width": width * scale,
@@ -201,12 +213,47 @@ function addRouteLayers(map: MapLibreMap, routes: TransitRoute[], width: number,
         },
       });
     });
-    if (showStops && route.stops.length) {
-      const stopId = `stops-${route.id}`;
-      map.addSource(stopId, { type: "geojson", data: { type: "FeatureCollection", features: route.stops.map((stop) => ({ type: "Feature", properties: { name: stop.name }, geometry: { type: "Point", coordinates: stop.coord } })) } as any });
-      map.addLayer({ id: stopId, type: "circle", source: stopId, paint: { "circle-radius": 3.5 * scale, "circle-color": "#fff", "circle-stroke-width": 2 * scale, "circle-stroke-color": route.color } });
-    }
   });
+
+  if (showStops) {
+    const mergedStops: { name: string; key: string; coord: Coord; colors: Set<string> }[] = [];
+    activeRoutes.forEach((route) => {
+      route.stops.forEach((stop) => {
+        const key = stopKey(stop.name);
+        const existing = mergedStops.find((item) => item.key === key && stopDistanceMetres(item.coord, stop.coord) <= 25);
+        if (existing) existing.colors.add(route.color);
+        else mergedStops.push({ name: stop.name, key, coord: stop.coord, colors: new Set([route.color]) });
+      });
+    });
+    if (mergedStops.length) {
+      const stopId = "stops-all";
+      map.addSource(stopId, {
+        type: "geojson",
+        data: {
+          type: "FeatureCollection",
+          features: mergedStops.map((stop) => ({
+            type: "Feature",
+            properties: {
+              name: stop.name,
+              stroke: stop.colors.size > 1 ? "#18252d" : [...stop.colors][0],
+            },
+            geometry: { type: "Point", coordinates: stop.coord },
+          })),
+        } as any,
+      });
+      map.addLayer({
+        id: stopId,
+        type: "circle",
+        source: stopId,
+        paint: {
+          "circle-radius": 3.5 * scale,
+          "circle-color": "#fff",
+          "circle-stroke-width": 2 * scale,
+          "circle-stroke-color": ["get", "stroke"],
+        },
+      });
+    }
+  }
 }
 
 export default function Home() {
