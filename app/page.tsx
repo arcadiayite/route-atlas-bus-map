@@ -126,18 +126,26 @@ function loadAmap() {
   if (typeof window === "undefined") return Promise.reject(new Error("仅支持浏览器调用"));
   if (window.AMap?.LineSearch) return Promise.resolve(window.AMap);
   if (amapPromise) return amapPromise;
-  const key = process.env.NEXT_PUBLIC_AMAP_KEY;
-  const securityJsCode = process.env.NEXT_PUBLIC_AMAP_SECURITY_CODE;
-  if (!key || !securityJsCode) return Promise.reject(new Error("尚未配置高德 Web API"));
-  window._AMapSecurityConfig = { securityJsCode };
-  amapPromise = new Promise((resolve, reject) => {
-    const script = document.createElement("script");
-    script.src = `https://webapi.amap.com/maps?v=2.0&key=${encodeURIComponent(key)}&plugin=AMap.LineSearch`;
-    script.async = true;
-    script.onload = () => window.AMap ? resolve(window.AMap) : reject(new Error("高德服务未能加载"));
-    script.onerror = () => reject(new Error("无法连接高德服务"));
-    document.head.appendChild(script);
-  });
+  amapPromise = fetch("/api/amap-config", { cache: "no-store" })
+    .then(async (response) => {
+      const config = await response.json();
+      if (!response.ok || !config.key || !config.securityJsCode) {
+        throw new Error(config.error || "尚未配置高德 Web API");
+      }
+      window._AMapSecurityConfig = { securityJsCode: config.securityJsCode };
+      return new Promise((resolve, reject) => {
+        const script = document.createElement("script");
+        script.src = `https://webapi.amap.com/maps?v=2.0&key=${encodeURIComponent(config.key)}&plugin=AMap.LineSearch`;
+        script.async = true;
+        script.onload = () => window.AMap ? resolve(window.AMap) : reject(new Error("高德服务未能加载"));
+        script.onerror = () => reject(new Error("无法连接高德服务"));
+        document.head.appendChild(script);
+      });
+    })
+    .catch((error) => {
+      amapPromise = null;
+      throw error;
+    });
   return amapPromise;
 }
 
