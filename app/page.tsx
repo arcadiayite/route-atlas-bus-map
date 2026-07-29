@@ -912,7 +912,7 @@ export default function Home() {
 
   useEffect(() => {
     if (!mapNode.current || mapRef.current) return;
-    maplibregl.setWorkerUrl("/maplibre-gl-worker.mjs");
+    maplibregl.setWorkerUrl(new URL("maplibre-gl-worker.mjs", document.baseURI).href);
     const map = new maplibregl.Map({
       container: mapNode.current,
       style: mapStyle(base, labels, maskOpacity),

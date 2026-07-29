@@ -1,98 +1,49 @@
-# vinext-starter
+# 路绘 · 公交线路可视化制图台
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+用于可视化一条或多条公交线路的地图制图工具，支持高德既有公交数据、自定义导航线路、共线并排、站点管理和高清导出。
 
-## Prerequisites
+## 主要能力
 
-- Node.js `>=22.13.0`
+- 纸感、地图册、暗色和卫星底图，地名与道路标注可独立开关
+- 多线路共线段自动等宽并排，保持线路顺序稳定
+- 标准实线、细实线、中空实线、短/中/长虚线和点划线
+- 既有公交查询，以及带首末站、中途站、途经点和导航偏好的自定义线路
+- 线路、站点、图例的显示控制与 PNG/SVG 框选导出
+- SVG 中每条公交线路保持为单一路径元素
+- 自动存档与手动存档
 
-## Quick Start
+## 公开版
+
+GitHub Pages：<https://arcadiayite.github.io/route-atlas-bus-map/>
+
+公开版不会把项目使用的高德 Key 或安全密钥写入仓库、构建产物或 GitHub Actions。访客需要在页面中填写自己的高德 Web 端 Key 与 `securityJsCode`，数据只保存在当前浏览器。公开版的自动存档和手动存档也使用浏览器本地存储。
+
+## 本地开发
+
+需要 Node.js `>=22.13.0`。
 
 ```bash
 npm install
 npm run dev
+```
+
+本地完整版本通过忽略的 `.env.local` 配置：
+
+```text
+AMAP_WEB_KEY=你的 Web 端 Key
+AMAP_SECURITY_CODE=你的安全密钥
+```
+
+不要提交 `.env.local`、API Key、安全密钥或访问令牌。
+
+## 构建
+
+```bash
 npm run build
+npm run build:pages
 ```
 
-This starter does not use `wrangler.jsonc`.
+- `npm run build`：生成 Sites/Cloudflare Worker 版本。
+- `npm run build:pages`：生成不含服务器接口和项目密钥的 GitHub Pages 静态版。
 
-## Included Shape
-
-- edit site code under `app/`
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
-
-## Workspace Auth Headers
-
-OpenAI workspace sites can read the current user's email from
-`oai-authenticated-user-email`.
-
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
-
-Treat the full name as optional and fall back to email when it is absent:
-
-```tsx
-import { headers } from "next/headers";
-
-export default async function Home() {
-  const requestHeaders = await headers();
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
-
-  const displayName = fullName ?? email;
-  // ...
-}
-```
-
-## Optional Dispatch-Owned ChatGPT Sign-In
-
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
-
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
-
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
-
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
-
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
-
-## Useful Commands
-
-- `npm run dev`: start local development
-- `npm run build`: verify the vinext build output
-- `npm test`: build the starter and verify its rendered loading skeleton
-- `npm run db:generate`: generate Drizzle migrations after schema changes
-
-## Learn More
-
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+推送到 `main` 后，`.github/workflows/deploy-pages.yml` 会自动构建并发布公开版。
