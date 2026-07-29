@@ -10,6 +10,7 @@ type RouteStatus = "searching" | "ready" | "error";
 type CustomNode = { id: string; kind: "stop" | "via"; value: string };
 type DrivingPreference = "fastest" | "avoidCongestion" | "avoidHighway" | "highwayFirst" | "avoidTolls";
 type StationDisplayMode = "none" | "terminals" | "all";
+type LineStyleKey = "solid" | "thin" | "hollow" | "dashShort" | "dashMedium" | "dashLong" | "dashDot";
 
 type TransitRoute = {
   id: string;
@@ -19,6 +20,7 @@ type TransitRoute = {
   to: string;
   color: string;
   dash: boolean;
+  lineStyle?: LineStyleKey;
   visible: boolean;
   path: Coord[];
   stops: { name: string; coord: Coord }[];
@@ -61,6 +63,25 @@ declare global {
 }
 
 const PALETTE = ["#f25f4b", "#008e88", "#efb72f", "#3867d6", "#9c5de8", "#d94786", "#4f772d"];
+const LINE_STYLE_PRESETS: { value: LineStyleKey; label: string; hint: string; widthScale: number; dashArray?: number[]; lineCap: "round" | "butt" }[] = [
+  { value: "solid", label: "标准实线", hint: "圆头连续线", widthScale: 1, lineCap: "round" },
+  { value: "thin", label: "细实线", hint: "适合线路较多的区域", widthScale: 0.68, lineCap: "round" },
+  { value: "hollow", label: "中空实线", hint: "彩色双边与白色线芯", widthScale: 1, lineCap: "round" },
+  { value: "dashShort", label: "短虚线", hint: "短划、紧间隔", widthScale: 1, dashArray: [0.75, 0.8], lineCap: "butt" },
+  { value: "dashMedium", label: "均衡虚线", hint: "常规虚线节奏", widthScale: 1, dashArray: [1.8, 1.35], lineCap: "butt" },
+  { value: "dashLong", label: "长虚线", hint: "长划、疏间隔", widthScale: 1, dashArray: [3.4, 1.45], lineCap: "butt" },
+  { value: "dashDot", label: "点划线", hint: "长划与短点交替", widthScale: 1, dashArray: [2.8, 1, 0.35, 1], lineCap: "round" },
+];
+
+function getLineStyleKey(route: Pick<TransitRoute, "lineStyle" | "dash">): LineStyleKey {
+  if (route.lineStyle && LINE_STYLE_PRESETS.some((item) => item.value === route.lineStyle)) return route.lineStyle;
+  return route.dash ? "dashMedium" : "solid";
+}
+
+function getLineStylePreset(route: Pick<TransitRoute, "lineStyle" | "dash">) {
+  const key = getLineStyleKey(route);
+  return LINE_STYLE_PRESETS.find((item) => item.value === key) ?? LINE_STYLE_PRESETS[0];
+}
 const DRIVING_PREFERENCES: { value: DrivingPreference; label: string; hint: string; policy: number }[] = [
   { value: "fastest", label: "速度优先", hint: "尽量缩短行驶时间", policy: 0 },
   { value: "avoidCongestion", label: "躲避拥堵", hint: "结合实时路况绕开拥堵", policy: 4 },
@@ -121,10 +142,8 @@ function mapStyle(base: BaseKey, labels: boolean, maskOpacity = 0): StyleSpecifi
     } as any,
   };
   const layers: any[] = [{ id: "basemap", type: "raster", source: "basemap", minzoom: 0, maxzoom: 22 }];
-  if (labels) {
-    sources.labels = { type: "raster", tiles: item.labels, tileSize: 256 };
-    layers.push({ id: "place-labels", type: "raster", source: "labels", minzoom: 0, maxzoom: 22 });
-  }
+  sources.labels = { type: "raster", tiles: item.labels, tileSize: 256 };
+  layers.push({ id: "place-labels", type: "raster", source: "labels", minzoom: 0, maxzoom: 22, layout: { visibility: labels ? "visible" : "none" } });
   layers.push({ id: "map-mask", type: "fill", source: "mask", paint: { "fill-color": "#ffffff", "fill-opacity": maskOpacity } });
   return { version: 8, sources, layers };
 }
@@ -460,15 +479,25 @@ function drawCanvasLegend(context: CanvasRenderingContext2D, width: number, heig
   context.fillText(`BUS ROUTES · ${String(routes.length).padStart(2, "0")}`, layout.x + layout.padding, layout.y + layout.padding + 8 * renderScale);
   routes.forEach((route, index) => {
     const y = layout.y + layout.padding + layout.titleHeight + index * layout.rowHeight + 7 * renderScale;
-    context.lineCap = "round";
+    const preset = getLineStylePreset(route);
+    const sampleWidth = 3 * renderScale * preset.widthScale;
+    context.lineCap = preset.lineCap;
+    context.setLineDash(preset.dashArray?.map((value) => value * 3 * renderScale) ?? []);
     if (showCasing) {
       context.strokeStyle = "#ffffff";
-      context.lineWidth = 6 * renderScale;
+      context.lineWidth = sampleWidth + 3 * renderScale;
       context.beginPath(); context.moveTo(layout.x + layout.padding, y); context.lineTo(layout.x + layout.padding + 22 * renderScale, y); context.stroke();
     }
     context.strokeStyle = route.color;
-    context.lineWidth = 3 * renderScale;
+    context.lineWidth = sampleWidth;
     context.beginPath(); context.moveTo(layout.x + layout.padding, y); context.lineTo(layout.x + layout.padding + 22 * renderScale, y); context.stroke();
+    if (getLineStyleKey(route) === "hollow") {
+      context.setLineDash([]);
+      context.strokeStyle = "#ffffff";
+      context.lineWidth = Math.max(renderScale, sampleWidth * 0.34);
+      context.beginPath(); context.moveTo(layout.x + layout.padding, y); context.lineTo(layout.x + layout.padding + 22 * renderScale, y); context.stroke();
+    }
+    context.setLineDash([]);
     context.fillStyle = "#17232b";
     context.font = `700 ${9 * renderScale}px "Microsoft YaHei", sans-serif`;
     const label = route.name.length > 18 ? `${route.name.slice(0, 17)}…` : route.name;
@@ -483,8 +512,13 @@ function makeSvgLegend(width: number, height: number, routes: TransitRoute[], po
   const rows = routes.map((route, index) => {
     const y = layout.y + layout.padding + layout.titleHeight + index * layout.rowHeight + 7 * renderScale;
     const label = route.name.length > 18 ? `${route.name.slice(0, 17)}…` : route.name;
-    const casing = showCasing ? `<line x1="${(layout.x + layout.padding).toFixed(2)}" y1="${y.toFixed(2)}" x2="${(layout.x + layout.padding + 22 * renderScale).toFixed(2)}" y2="${y.toFixed(2)}" stroke="#ffffff" stroke-width="${(6 * renderScale).toFixed(2)}" stroke-linecap="round"/>` : "";
-    return `<g id="legend-route-${index + 1}" data-route-id="${escapeXml(route.id)}">${casing}<line x1="${(layout.x + layout.padding).toFixed(2)}" y1="${y.toFixed(2)}" x2="${(layout.x + layout.padding + 22 * renderScale).toFixed(2)}" y2="${y.toFixed(2)}" stroke="${escapeXml(route.color)}" stroke-width="${(3 * renderScale).toFixed(2)}" stroke-linecap="round"/><text x="${(layout.x + layout.padding + 31 * renderScale).toFixed(2)}" y="${(y + 3 * renderScale).toFixed(2)}" fill="#17232b" font-family="Microsoft YaHei, sans-serif" font-size="${(9 * renderScale).toFixed(2)}" font-weight="700">${escapeXml(label)}</text></g>`;
+    const preset = getLineStylePreset(route);
+    const sampleWidth = 3 * renderScale * preset.widthScale;
+    const cap = preset.lineCap;
+    const dash = preset.dashArray ? ` stroke-dasharray="${preset.dashArray.map((value) => (value * 3 * renderScale).toFixed(2)).join(" ")}"` : "";
+    const casing = showCasing ? `<line x1="${(layout.x + layout.padding).toFixed(2)}" y1="${y.toFixed(2)}" x2="${(layout.x + layout.padding + 22 * renderScale).toFixed(2)}" y2="${y.toFixed(2)}" stroke="#ffffff" stroke-width="${(sampleWidth + 3 * renderScale).toFixed(2)}" stroke-linecap="${cap}"/>` : "";
+    const hollow = getLineStyleKey(route) === "hollow" ? `<line x1="${(layout.x + layout.padding).toFixed(2)}" y1="${y.toFixed(2)}" x2="${(layout.x + layout.padding + 22 * renderScale).toFixed(2)}" y2="${y.toFixed(2)}" stroke="#ffffff" stroke-width="${Math.max(renderScale, sampleWidth * 0.34).toFixed(2)}" stroke-linecap="round"/>` : "";
+    return `<g id="legend-route-${index + 1}" data-route-id="${escapeXml(route.id)}">${casing}<line x1="${(layout.x + layout.padding).toFixed(2)}" y1="${y.toFixed(2)}" x2="${(layout.x + layout.padding + 22 * renderScale).toFixed(2)}" y2="${y.toFixed(2)}" stroke="${escapeXml(route.color)}" stroke-width="${sampleWidth.toFixed(2)}" stroke-linecap="${cap}"${dash}/>${hollow}<text x="${(layout.x + layout.padding + 31 * renderScale).toFixed(2)}" y="${(y + 3 * renderScale).toFixed(2)}" fill="#17232b" font-family="Microsoft YaHei, sans-serif" font-size="${(9 * renderScale).toFixed(2)}" font-weight="700">${escapeXml(label)}</text></g>`;
   }).join("");
   return `<g id="legend"><rect x="${layout.x.toFixed(2)}" y="${layout.y.toFixed(2)}" width="${layout.width.toFixed(2)}" height="${layout.height.toFixed(2)}" fill="#fbfaf6" fill-opacity=".95" stroke="#223035" stroke-opacity=".2"/><text x="${(layout.x + layout.padding).toFixed(2)}" y="${(layout.y + layout.padding + 8 * renderScale).toFixed(2)}" fill="#707a7c" font-family="Microsoft YaHei, sans-serif" font-size="${(8 * renderScale).toFixed(2)}" font-weight="800">BUS ROUTES · ${String(routes.length).padStart(2, "0")}</text>${rows}</g>`;
 }
@@ -535,24 +569,33 @@ function addRouteLayers(
     [...offsetGroups.entries()].forEach(([offset, groupFeatures], groupIndex) => {
       const sourceId = `route-${route.id}-${groupIndex}`;
       map.addSource(sourceId, { type: "geojson", data: { type: "FeatureCollection", features: groupFeatures } as any });
+      const lineStyle = getLineStylePreset(route);
+      const renderedWidth = width * scale * lineStyle.widthScale;
       if (showCasing) {
         map.addLayer({
           id: `${sourceId}-casing`, type: "line", source: sourceId,
-          layout: { "line-cap": "round", "line-join": "bevel" },
-          paint: { "line-color": "#ffffff", "line-opacity": 0.92, "line-width": width * scale + 3 * scale, "line-offset": offset },
+          layout: { "line-cap": lineStyle.lineCap, "line-join": "bevel" },
+          paint: { "line-color": "#ffffff", "line-opacity": 0.92, "line-width": renderedWidth + 3 * scale, "line-offset": offset },
         });
       }
       map.addLayer({
         id: sourceId, type: "line", source: sourceId,
-        layout: { "line-cap": "round", "line-join": "bevel" },
+        layout: { "line-cap": lineStyle.lineCap, "line-join": "bevel" },
         paint: {
           "line-color": route.color,
-          "line-width": width * scale,
+          "line-width": renderedWidth,
           "line-opacity": 1,
           "line-offset": offset,
-          ...(route.dash ? { "line-dasharray": [1.8, 1.35] } : {}),
+          ...(lineStyle.dashArray ? { "line-dasharray": lineStyle.dashArray } : {}),
         },
       });
+      if (getLineStyleKey(route) === "hollow") {
+        map.addLayer({
+          id: `${sourceId}-hollow`, type: "line", source: sourceId,
+          layout: { "line-cap": "round", "line-join": "bevel" },
+          paint: { "line-color": "#ffffff", "line-opacity": 0.96, "line-width": Math.max(1, renderedWidth * 0.34), "line-offset": offset },
+        });
+      }
     });
   });
 
@@ -677,7 +720,7 @@ export default function Home() {
   const latestStopModeRef = useRef(stopMode);
   const latestStopEditingRef = useRef(stopEditing);
   const latestHiddenStopIdsRef = useRef(hiddenStopIds);
-  const styleKeyRef = useRef(`${base}:${labels}`);
+  const styleKeyRef = useRef(base);
   const fitAfterLoadRef = useRef(false);
   const pendingCameraRef = useRef<MapCamera | null>(null);
 
@@ -718,7 +761,7 @@ export default function Home() {
   const applyArchivePayload = useCallback((payload: ArchivePayload) => {
     if (!payload || payload.version !== 1 || !Array.isArray(payload.routes)) throw new Error("存档格式不受支持");
     setCity(payload.city || "珠海市");
-    setRoutes(payload.routes.map((route) => ({ ...route, status: "ready" })));
+    setRoutes(payload.routes.map((route) => ({ ...route, lineStyle: getLineStyleKey(route), status: "ready" })));
     if (payload.base && BASES[payload.base]) setBase(payload.base);
     setLabels(Boolean(payload.labels));
     setShowStops(Boolean(payload.showStops));
@@ -910,19 +953,29 @@ export default function Home() {
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!map) return;
-    const styleKey = `${base}:${labels}`;
-    if (styleKeyRef.current === styleKey) return;
-    styleKeyRef.current = styleKey;
-    map.setStyle(mapStyle(base, labels, maskOpacity));
+    if (!map || styleKeyRef.current === base) return;
+    styleKeyRef.current = base;
     const restoreRoutes = () => {
       clearRouteLayers(map);
       addRouteLayers(map, latestRoutesRef.current, latestLineWidthRef.current, latestShowCasingRef.current, latestShowStopsRef.current, 1, latestStopModeRef.current, latestHiddenStopIdsRef.current, latestStopEditingRef.current);
       map.triggerRepaint();
     };
     map.once("style.load", restoreRoutes);
+    map.setStyle(mapStyle(base, labels, maskOpacity));
     return () => { map.off("style.load", restoreRoutes); };
-  }, [base, labels]);
+  }, [base]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const applyLabels = () => {
+      if (map.getLayer("place-labels")) map.setLayoutProperty("place-labels", "visibility", labels ? "visible" : "none");
+      map.triggerRepaint();
+    };
+    if (map.isStyleLoaded()) applyLabels();
+    else map.once("style.load", applyLabels);
+    return () => { map.off("style.load", applyLabels); };
+  }, [labels]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -988,7 +1041,7 @@ export default function Home() {
 
   async function searchOne(term: string, index: number) {
     const id = `${Date.now()}-${index}-${Math.random().toString(36).slice(2, 6)}`;
-    const pending: TransitRoute = { id, query: term, name: term, from: "", to: "", color: PALETTE[(routes.length + index) % PALETTE.length], dash: false, visible: true, path: [], stops: [], status: "searching" };
+    const pending: TransitRoute = { id, query: term, name: term, from: "", to: "", color: PALETTE[(routes.length + index) % PALETTE.length], dash: false, lineStyle: "solid", visible: true, path: [], stops: [], status: "searching" };
     setRoutes((current) => [...current, pending]);
     try {
       const AMap = await loadAmap();
@@ -1059,6 +1112,7 @@ export default function Home() {
       to: end,
       color: PALETTE[routes.length % PALETTE.length],
       dash: false,
+      lineStyle: "solid",
       visible: true,
       path: [],
       stops: [],
@@ -1132,6 +1186,12 @@ export default function Home() {
 
   function updateRoute(id: string, patch: Partial<TransitRoute>) {
     setRoutes((current) => current.map((route) => route.id === id ? { ...route, ...patch } : route));
+  }
+
+  function setRouteLineStyle(id: string, lineStyle: LineStyleKey) {
+    updateRoute(id, { lineStyle, dash: lineStyle.startsWith("dash") });
+    const preset = LINE_STYLE_PRESETS.find((item) => item.value === lineStyle);
+    setNotice(`线路线型已切换为${preset?.label ?? "所选样式"}`);
   }
 
   function toggleRouteVisibility(route: TransitRoute) {
@@ -1327,9 +1387,14 @@ export default function Home() {
           return offsetSvgPath(points, Number(feature.properties.offset) || 0);
         }).filter(Boolean).join(" ");
         if (!combinedPath) return "";
-        const dash = route.dash ? ` stroke-dasharray="${(lineWidth * renderScale * 1.8).toFixed(2)} ${(lineWidth * renderScale * 1.35).toFixed(2)}"` : "";
-        const casingFilter = showCasing ? ` filter="url(#route-casing)"` : "";
-        return `<g id="route-${routeIndex + 1}" data-route-id="${escapeXml(route.id)}" data-route-name="${escapeXml(route.name)}"><title>${escapeXml(route.name)}</title><path id="route-${routeIndex + 1}-path" d="${combinedPath}" fill="none" stroke="${escapeXml(route.color)}" stroke-width="${(lineWidth * renderScale).toFixed(2)}" stroke-linecap="round" stroke-linejoin="bevel"${dash}${casingFilter}/></g>`;
+        const preset = getLineStylePreset(route);
+        const styleKey = getLineStyleKey(route);
+        const renderedWidth = lineWidth * renderScale * preset.widthScale;
+        const dash = preset.dashArray ? ` stroke-dasharray="${preset.dashArray.map((value) => (value * lineWidth * renderScale).toFixed(2)).join(" ")}"` : "";
+        const stroke = styleKey === "hollow" ? "#ffffff" : route.color;
+        const strokeWidth = styleKey === "hollow" ? Math.max(renderScale, renderedWidth * 0.34) : renderedWidth;
+        const filter = styleKey === "hollow" ? ` filter="url(#route-hollow-${routeIndex + 1})"` : showCasing ? ` filter="url(#route-casing)"` : "";
+        return `<g id="route-${routeIndex + 1}" data-route-id="${escapeXml(route.id)}" data-route-name="${escapeXml(route.name)}"><title>${escapeXml(route.name)}</title><path id="route-${routeIndex + 1}-path" d="${combinedPath}" fill="none" stroke="${escapeXml(stroke)}" stroke-width="${strokeWidth.toFixed(2)}" stroke-linecap="${preset.lineCap}" stroke-linejoin="bevel"${dash}${filter}/></g>`;
       }).join("");
 
       const stationMarkup = showStops ? collectExportStops(routes, stopMode, hiddenStopIds).map((stop, index) => {
@@ -1339,9 +1404,19 @@ export default function Home() {
         return `<g id="station-${index + 1}" data-station-id="${escapeXml(stop.id)}" data-station-name="${escapeXml(stop.name)}"><title>${escapeXml(stop.name)}</title><circle cx="${point.x.toFixed(2)}" cy="${point.y.toFixed(2)}" r="${radius.toFixed(2)}" fill="#ffffff" stroke="${escapeXml(stroke)}" stroke-width="${(2 * renderScale).toFixed(2)}"/></g>`;
       }).join("") : "";
       const legendMarkup = exportLegend ? makeSvgLegend(width, height, activeRoutes, legendPosition, renderScale, showCasing) : "";
-      const casingFilter = showCasing ? `<defs><filter id="route-casing" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB"><feMorphology in="SourceAlpha" operator="dilate" radius="${(1.5 * renderScale).toFixed(2)}" result="expanded"/><feFlood flood-color="#ffffff" flood-opacity=".92" result="white"/><feComposite in="white" in2="expanded" operator="in" result="casing"/><feMerge><feMergeNode in="casing"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>` : "";
+      const casingFilter = showCasing ? `<filter id="route-casing" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB"><feMorphology in="SourceAlpha" operator="dilate" radius="${(1.5 * renderScale).toFixed(2)}" result="expanded"/><feFlood flood-color="#ffffff" flood-opacity=".92" result="white"/><feComposite in="white" in2="expanded" operator="in" result="casing"/><feMerge><feMergeNode in="casing"/><feMergeNode in="SourceGraphic"/></feMerge></filter>` : "";
+      const hollowFilters = activeRoutes.map((route, routeIndex) => {
+        if (getLineStyleKey(route) !== "hollow") return "";
+        const renderedWidth = lineWidth * renderScale * getLineStylePreset(route).widthScale;
+        const innerWidth = Math.max(renderScale, renderedWidth * 0.34);
+        const edgeRadius = Math.max(renderScale, (renderedWidth - innerWidth) / 2);
+        const casing = showCasing ? `<feMorphology in="SourceAlpha" operator="dilate" radius="${(edgeRadius + 1.5 * renderScale).toFixed(2)}" result="casingAlpha"/><feFlood flood-color="#ffffff" flood-opacity=".92" result="casingColor"/><feComposite in="casingColor" in2="casingAlpha" operator="in" result="casing"/>` : "";
+        const casingNode = showCasing ? `<feMergeNode in="casing"/>` : "";
+        return `<filter id="route-hollow-${routeIndex + 1}" x="-25%" y="-25%" width="150%" height="150%" color-interpolation-filters="sRGB">${casing}<feMorphology in="SourceAlpha" operator="dilate" radius="${edgeRadius.toFixed(2)}" result="edgeAlpha"/><feFlood flood-color="${escapeXml(route.color)}" result="edgeColor"/><feComposite in="edgeColor" in2="edgeAlpha" operator="in" result="edge"/><feMerge>${casingNode}<feMergeNode in="edge"/><feMergeNode in="SourceGraphic"/></feMerge></filter>`;
+      }).join("");
+      const routeFilters = casingFilter || hollowFilters ? `<defs>${casingFilter}${hollowFilters}</defs>` : "";
 
-      const svg = `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeXml(city)}公交线路图"><title>${escapeXml(city)}公交线路图</title><metadata>由路绘导出；每条线路均为单一路径元素，站点和图例为独立矢量分组。</metadata>${casingFilter}<g id="basemap"><image href="${background}" x="0" y="0" width="${width}" height="${height}"/></g><g id="routes">${routeMarkup}</g><g id="stations">${stationMarkup}</g>${legendMarkup}</svg>`;
+      const svg = `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeXml(city)}公交线路图"><title>${escapeXml(city)}公交线路图</title><metadata>由路绘导出；每条线路均为单一路径元素，站点和图例为独立矢量分组。</metadata>${routeFilters}<g id="basemap"><image href="${background}" x="0" y="0" width="${width}" height="${height}"/></g><g id="routes">${routeMarkup}</g><g id="stations">${stationMarkup}</g>${legendMarkup}</svg>`;
       const blob = new Blob([svg], { type: "image/svg+xml;charset=utf-8" });
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
@@ -1448,7 +1523,7 @@ export default function Home() {
                 {route.status === "ready" && <div className="route-tools">
                   <button type="button" className={`visibility-control ${route.visible ? "selected" : ""}`} onClick={() => toggleRouteVisibility(route)}>{route.visible ? "隐藏线路" : "显示线路"}</button>
                   <label className="color-control"><input type="color" value={route.color} onChange={(event) => updateRoute(route.id, { color: event.target.value })} /><span style={{ background: route.color }} />颜色</label>
-                  <button className={route.dash ? "selected" : ""} onClick={() => updateRoute(route.id, { dash: !route.dash })}><i className={route.dash ? "dash" : "solid"} />{route.dash ? "虚线" : "实线"}</button>
+                  <button type="button" onClick={() => setPanel("layers")} title="前往底图菜单选择线型"><i className={`line-style-preview ${getLineStyleKey(route)}`} style={{ color: route.color }} />{getLineStylePreset(route).label}</button>
                   <span>{route.stops.length} 站</span>
                 </div>}
               </article>)}
@@ -1460,11 +1535,20 @@ export default function Home() {
             {readyRoutes.length > 0 && <div className="route-layer-manager">
               <div className="layer-manager-heading"><div><strong>线路图层</strong><span>{visibleReadyRoutes.length}/{readyRoutes.length} 条显示中</span></div>{hiddenReadyRoutes.length > 0 && <button type="button" onClick={showAllRoutes}>全部显示</button>}</div>
               <div className="route-layer-list">
-                {readyRoutes.map((route) => <button type="button" key={route.id} className={route.visible ? "visible" : "hidden"} onClick={() => toggleRouteVisibility(route)} aria-pressed={route.visible}>
-                  <i style={{ background: route.color }} />
-                  <span><strong>{route.name}</strong><small>{route.visible ? `已显示 · ${route.stops.length} 站` : "已隐藏 · 点击恢复"}</small></span>
-                  <b>{route.visible ? "显示中" : "已隐藏"}</b>
-                </button>)}
+                {readyRoutes.map((route) => <div className={`route-layer-item ${route.visible ? "visible" : "hidden"}`} key={route.id}>
+                  <button type="button" className="route-layer-toggle" onClick={() => toggleRouteVisibility(route)} aria-pressed={route.visible}>
+                    <i style={{ background: route.color }} />
+                    <span><strong>{route.name}</strong><small>{route.visible ? `已显示 · ${route.stops.length} 站` : "已隐藏 · 点击恢复"}</small></span>
+                    <b>{route.visible ? "显示中" : "已隐藏"}</b>
+                  </button>
+                  <label className="line-style-select">
+                    <i className={`line-style-preview ${getLineStyleKey(route)}`} style={{ color: route.color }} />
+                    <span>线型</span>
+                    <select value={getLineStyleKey(route)} onChange={(event) => setRouteLineStyle(route.id, event.target.value as LineStyleKey)} aria-label={`${route.name} 的线路样式`}>
+                      {LINE_STYLE_PRESETS.map((preset) => <option key={preset.value} value={preset.value}>{preset.label} · {preset.hint}</option>)}
+                    </select>
+                  </label>
+                </div>)}
               </div>
             </div>}
             <div className="base-grid">
@@ -1539,7 +1623,7 @@ export default function Home() {
         </div>
         {visibleReadyRoutes.length > 0 && <div className="legend" style={{ left: `${legendPosition.x * 100}%`, top: `${legendPosition.y * 100}%` }} onPointerDown={startLegendDrag} onPointerMove={moveLegendDrag} onPointerUp={endLegendDrag} onPointerCancel={endLegendDrag} role="group" aria-label="可拖动线路图例">
           <p>BUS ROUTES · {String(visibleReadyRoutes.length).padStart(2, "0")}<b>拖动</b></p>
-          {visibleReadyRoutes.map((route) => <div key={route.id}><i style={{ background: route.color }} /><span>{route.name}</span></div>)}
+          {visibleReadyRoutes.map((route) => <div key={route.id}><i className={`line-style-preview ${getLineStyleKey(route)}`} style={{ color: route.color }} /><span>{route.name}</span></div>)}
         </div>}
         {readyRoutes.length === 0 && <div className="map-onboarding"><span>01</span><div><strong>输入线路，开始绘制</strong><p>支持多线路自动并行、卫星底图与高清框选导出</p></div></div>}
         <div className="scale-note">数据：高德开放平台 · 底图：{BASES[base].name}</div>
