@@ -9,6 +9,7 @@ type BaseKey = "paper" | "atlas" | "dark" | "satellite";
 type RouteStatus = "searching" | "ready" | "error";
 type CustomNode = { id: string; kind: "stop" | "via"; value: string };
 type DrivingPreference = "fastest" | "avoidCongestion" | "avoidHighway" | "highwayFirst" | "avoidTolls";
+type StationDisplayMode = "none" | "terminals" | "all";
 
 type TransitRoute = {
   id: string;
@@ -690,6 +691,7 @@ export default function Home() {
 
   const readyRoutes = useMemo(() => routes.filter((route) => route.status === "ready"), [routes]);
   const visibleReadyRoutes = useMemo(() => readyRoutes.filter((route) => route.visible), [readyRoutes]);
+  const hiddenReadyRoutes = useMemo(() => readyRoutes.filter((route) => !route.visible), [readyRoutes]);
   const manualArchives = useMemo(() => archives.filter((archive) => archive.kind === "manual"), [archives]);
   const autoArchive = useMemo(() => archives.find((archive) => archive.kind === "auto"), [archives]);
 
@@ -1132,6 +1134,28 @@ export default function Home() {
     setRoutes((current) => current.map((route) => route.id === id ? { ...route, ...patch } : route));
   }
 
+  function toggleRouteVisibility(route: TransitRoute) {
+    const visible = !route.visible;
+    updateRoute(route.id, { visible });
+    setNotice(`${route.name} 已${visible ? "恢复显示" : "隐藏"}${visible && showStops ? "，站点同步恢复" : ""}`);
+  }
+
+  function showAllRoutes() {
+    setRoutes((current) => current.map((route) => route.status === "ready" ? { ...route, visible: true } : route));
+    setNotice("已恢复显示全部线路及其站点");
+  }
+
+  function changeStationDisplay(mode: StationDisplayMode) {
+    if (mode === "none") {
+      setShowStops(false);
+      setNotice("公交站点已关闭");
+      return;
+    }
+    setShowStops(true);
+    setStopMode(mode);
+    setNotice(mode === "all" ? "已显示首末站和全部中途站" : "当前仅显示每条线路的首末站");
+  }
+
   function beginRenameRoute(route: TransitRoute) {
     setEditingRouteId(route.id);
     setRouteNameDraft(route.name);
@@ -1399,10 +1423,17 @@ export default function Home() {
             </form>}
 
             <div className="route-stack">
+              {hiddenReadyRoutes.length > 0 && <div className="hidden-routes-banner">
+                <div><strong>{hiddenReadyRoutes.length} 条线路已隐藏</strong><span>线路仍保留在项目中，可随时恢复。</span></div>
+                <button type="button" onClick={showAllRoutes}>全部显示</button>
+                <div className="hidden-route-chips" aria-label="恢复单条隐藏线路">
+                  {hiddenReadyRoutes.map((route) => <button type="button" key={route.id} onClick={() => toggleRouteVisibility(route)}><i style={{ background: route.color }} />显示 {route.name}</button>)}
+                </div>
+              </div>}
               {routes.length === 0 && <div className="empty-card"><div className="mini-map"><i /><i /><i /></div><h3>画布还是空的</h3><p>输入本地公交线路名称，高德将返回走向与站点。</p></div>}
               {routes.map((route, index) => <article className={`route-card ${route.status} ${route.visible ? "" : "hidden"}`} key={route.id}>
                 <div className="route-card-top">
-                  <button type="button" className={`eye ${route.visible ? "on" : ""}`} onClick={() => updateRoute(route.id, { visible: !route.visible })} aria-label={route.visible ? `隐藏 ${route.name} 及其站点` : `显示 ${route.name} 及其站点`} title={route.visible ? "隐藏线路及其站点" : "显示线路及其站点"}>{route.visible ? "●" : "○"}</button>
+                  <button type="button" className={`eye ${route.visible ? "on" : ""}`} onClick={() => toggleRouteVisibility(route)} aria-label={route.visible ? `隐藏 ${route.name} 及其站点` : `显示 ${route.name} 及其站点`} title={route.visible ? "隐藏线路及其站点" : "显示线路及其站点"}>{route.visible ? "●" : "○"}</button>
                   <div className="route-index">{String(index + 1).padStart(2, "0")}</div>
                   <div className="route-title">
                     {editingRouteId === route.id ? <form className="route-rename" onSubmit={(event) => { event.preventDefault(); saveRouteName(route.id); }}>
@@ -1415,10 +1446,10 @@ export default function Home() {
                   <button className="remove" onClick={() => removeRoute(route.id)} aria-label={`删除 ${route.name}`}>×</button>
                 </div>
                 {route.status === "ready" && <div className="route-tools">
-                  <button type="button" className={`visibility-control ${route.visible ? "selected" : ""}`} onClick={() => updateRoute(route.id, { visible: !route.visible })}>{route.visible ? "隐藏线路" : "显示线路"}</button>
+                  <button type="button" className={`visibility-control ${route.visible ? "selected" : ""}`} onClick={() => toggleRouteVisibility(route)}>{route.visible ? "隐藏线路" : "显示线路"}</button>
                   <label className="color-control"><input type="color" value={route.color} onChange={(event) => updateRoute(route.id, { color: event.target.value })} /><span style={{ background: route.color }} />颜色</label>
                   <button className={route.dash ? "selected" : ""} onClick={() => updateRoute(route.id, { dash: !route.dash })}><i className={route.dash ? "dash" : "solid"} />{route.dash ? "虚线" : "实线"}</button>
-                  <span>{route.path.length} 节点</span>
+                  <span>{route.stops.length} 站</span>
                 </div>}
               </article>)}
             </div>
@@ -1426,6 +1457,16 @@ export default function Home() {
 
           {panel === "layers" && <section className="panel-section">
             <div className="section-heading"><div><p className="eyebrow">MAP STYLE</p><h2>选择地图风格</h2></div></div>
+            {readyRoutes.length > 0 && <div className="route-layer-manager">
+              <div className="layer-manager-heading"><div><strong>线路图层</strong><span>{visibleReadyRoutes.length}/{readyRoutes.length} 条显示中</span></div>{hiddenReadyRoutes.length > 0 && <button type="button" onClick={showAllRoutes}>全部显示</button>}</div>
+              <div className="route-layer-list">
+                {readyRoutes.map((route) => <button type="button" key={route.id} className={route.visible ? "visible" : "hidden"} onClick={() => toggleRouteVisibility(route)} aria-pressed={route.visible}>
+                  <i style={{ background: route.color }} />
+                  <span><strong>{route.name}</strong><small>{route.visible ? `已显示 · ${route.stops.length} 站` : "已隐藏 · 点击恢复"}</small></span>
+                  <b>{route.visible ? "显示中" : "已隐藏"}</b>
+                </button>)}
+              </div>
+            </div>}
             <div className="base-grid">
               {(Object.keys(BASES) as BaseKey[]).map((key) => <button key={key} className={`base-card ${key} ${base === key ? "active" : ""}`} onClick={() => setBase(key)}>
                 <span className="base-preview"><i /><i /><i /></span><strong>{BASES[key].name}</strong><small>{BASES[key].hint}</small><b>{base === key ? "✓" : ""}</b>
@@ -1434,8 +1475,8 @@ export default function Home() {
             <div className="settings-list">
               <label><div><strong>地名与道路标注</strong><span>可独立于底图显示</span></div><input type="checkbox" checked={labels} onChange={(event) => setLabels(event.target.checked)} /><i /></label>
               <label><div><strong>线路白色描边</strong><span>增强复杂底图上的线路对比，默认关闭</span></div><input type="checkbox" checked={showCasing} onChange={(event) => setShowCasing(event.target.checked)} /><i /></label>
-              <label><div><strong>公交站点</strong><span>按线路颜色描边</span></div><input type="checkbox" checked={showStops} onChange={(event) => setShowStops(event.target.checked)} /><i /></label>
-              <label><div><strong>仅显示首末站</strong><span>每条线路只保留起点和终点</span></div><input type="checkbox" checked={stopMode === "terminals"} onChange={(event) => setStopMode(event.target.checked ? "terminals" : "all")} /><i /></label>
+              <label><div><strong>全部公交站点</strong><span>开启时显示首末站和全部中途站</span></div><input type="checkbox" checked={showStops} onChange={(event) => changeStationDisplay(event.target.checked ? "all" : "none")} /><i /></label>
+              <label><div><strong>只看首末站</strong><span>开启后收起中途站；关闭恢复全部站点</span></div><input type="checkbox" checked={showStops && stopMode === "terminals"} onChange={(event) => changeStationDisplay(event.target.checked ? "terminals" : "all")} /><i /></label>
               <label><div><strong>站点隐藏编辑</strong><span>点击地图站点可隐藏或恢复</span></div><input type="checkbox" checked={stopEditing} onChange={(event) => setStopEditing(event.target.checked)} /><i /></label>
             </div>
             {hiddenStopIds.length > 0 && <button className="restore-stops" onClick={() => { setHiddenStopIds([]); setNotice("已恢复全部隐藏站点"); }}>恢复全部隐藏站点 <span>{hiddenStopIds.length}</span></button>}
