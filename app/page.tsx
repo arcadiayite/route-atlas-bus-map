@@ -7,7 +7,9 @@ import type { Map as MapLibreMap, StyleSpecification } from "maplibre-gl";
 type Coord = [number, number];
 type BaseKey = "paper" | "atlas" | "dark" | "satellite";
 type RouteStatus = "searching" | "ready" | "error";
-type CustomNode = { id: string; kind: "stop" | "via"; value: string };
+type CustomNode = { id: string; kind: "stop" | "via"; value: string; coord?: Coord };
+type MapPickTarget = { nodeId: string; kind: CustomNode["kind"] };
+type CustomPlanFailure = { message: string; timedOut: boolean };
 type DrivingPreference = "fastest" | "avoidCongestion" | "avoidHighway" | "highwayFirst" | "avoidTolls";
 type StationDisplayMode = "none" | "terminals" | "all";
 type LineStyleKey = "solid" | "thin" | "hollow" | "dashShort" | "dashMedium" | "dashLong" | "dashDot";
@@ -178,6 +180,27 @@ function gcjToWgs([lng, lat]: Coord): Coord {
   dLat = (dLat * 180) / (((a * (1 - ee)) / (magic * sqrtMagic)) * Math.PI);
   dLng = (dLng * 180) / ((a / sqrtMagic) * Math.cos(radLat) * Math.PI);
   return [lng * 2 - (lng + dLng), lat * 2 - (lat + dLat)];
+}
+
+function wgsToGcj([lng, lat]: Coord): Coord {
+  if (outOfChina(lng, lat)) return [lng, lat];
+  const projected = gcjToWgs([lng, lat]);
+  return [lng * 2 - projected[0], lat * 2 - projected[1]];
+}
+
+class CustomRouteTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CustomRouteTimeoutError";
+  }
+}
+
+function withCustomRouteTimeout<T>(task: Promise<T>, timeoutMs: number, label: string) {
+  let timer = 0;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = window.setTimeout(() => reject(new CustomRouteTimeoutError(`${label}超时`)), timeoutMs);
+  });
+  return Promise.race([task, timeout]).finally(() => window.clearTimeout(timer));
 }
 
 function readGcjLngLat(value: any): Coord | null {
@@ -546,6 +569,33 @@ function clearRouteLayers(map: MapLibreMap) {
   });
 }
 
+function clearCustomDraftLayers(map: MapLibreMap) {
+  if (map.getLayer("custom-draft-points-layer")) map.removeLayer("custom-draft-points-layer");
+  if (map.getSource("custom-draft-points")) map.removeSource("custom-draft-points");
+}
+
+function addCustomDraftLayers(map: MapLibreMap, nodes: CustomNode[]) {
+  clearCustomDraftLayers(map);
+  const features = nodes.flatMap((node, index) => node.coord ? [{
+    type: "Feature",
+    properties: { id: node.id, kind: node.kind, index: index + 1 },
+    geometry: { type: "Point", coordinates: node.coord },
+  }] : []);
+  if (!features.length) return;
+  map.addSource("custom-draft-points", { type: "geojson", data: { type: "FeatureCollection", features } as any });
+  map.addLayer({
+    id: "custom-draft-points-layer",
+    type: "circle",
+    source: "custom-draft-points",
+    paint: {
+      "circle-radius": ["case", ["==", ["get", "kind"], "stop"], 7, 5],
+      "circle-color": ["case", ["==", ["get", "kind"], "stop"], "#f25f4b", "#008e88"],
+      "circle-stroke-color": "#ffffff",
+      "circle-stroke-width": 2,
+    },
+  });
+}
+
 function addRouteLayers(
   map: MapLibreMap,
   routes: TransitRoute[],
@@ -685,6 +735,8 @@ export default function Home() {
   const [customNodes, setCustomNodes] = useState<CustomNode[]>([]);
   const [drivingPreference, setDrivingPreference] = useState<DrivingPreference>("fastest");
   const [planningCustom, setPlanningCustom] = useState(false);
+  const [customPlanFailure, setCustomPlanFailure] = useState<CustomPlanFailure | null>(null);
+  const [mapPickTarget, setMapPickTarget] = useState<MapPickTarget | null>(null);
   const [routes, setRoutes] = useState<TransitRoute[]>([]);
   const [base, setBase] = useState<BaseKey>("paper");
   const [labels, setLabels] = useState(true);
@@ -720,6 +772,7 @@ export default function Home() {
   const latestStopModeRef = useRef(stopMode);
   const latestStopEditingRef = useRef(stopEditing);
   const latestHiddenStopIdsRef = useRef(hiddenStopIds);
+  const latestCustomNodesRef = useRef(customNodes);
   const styleKeyRef = useRef(base);
   const fitAfterLoadRef = useRef(false);
   const pendingCameraRef = useRef<MapCamera | null>(null);
@@ -731,6 +784,7 @@ export default function Home() {
   latestStopModeRef.current = stopMode;
   latestStopEditingRef.current = stopEditing;
   latestHiddenStopIdsRef.current = hiddenStopIds;
+  latestCustomNodesRef.current = customNodes;
 
   const readyRoutes = useMemo(() => routes.filter((route) => route.status === "ready"), [routes]);
   const visibleReadyRoutes = useMemo(() => readyRoutes.filter((route) => route.visible), [readyRoutes]);
@@ -937,6 +991,7 @@ export default function Home() {
     map.once("style.load", () => {
       clearRouteLayers(map);
       addRouteLayers(map, latestRoutesRef.current, latestLineWidthRef.current, latestShowCasingRef.current, latestShowStopsRef.current, 1, latestStopModeRef.current, latestHiddenStopIdsRef.current, latestStopEditingRef.current);
+      addCustomDraftLayers(map, latestCustomNodesRef.current);
     });
     map.once("load", () => {
       if (pendingCameraRef.current) {
@@ -958,6 +1013,7 @@ export default function Home() {
     const restoreRoutes = () => {
       clearRouteLayers(map);
       addRouteLayers(map, latestRoutesRef.current, latestLineWidthRef.current, latestShowCasingRef.current, latestShowStopsRef.current, 1, latestStopModeRef.current, latestHiddenStopIdsRef.current, latestStopEditingRef.current);
+      addCustomDraftLayers(map, latestCustomNodesRef.current);
       map.triggerRepaint();
     };
     map.once("style.load", restoreRoutes);
@@ -1001,6 +1057,40 @@ export default function Home() {
     return () => { map.off("style.load", renderRoutes); };
   }, [routes, lineWidth, showCasing, showStops, stopMode, hiddenStopIds, stopEditing]);
 
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const renderDraftPoints = () => {
+      addCustomDraftLayers(map, customNodes);
+      map.triggerRepaint();
+    };
+    if (map.isStyleLoaded()) renderDraftPoints();
+    else map.once("style.load", renderDraftPoints);
+    return () => { map.off("style.load", renderDraftPoints); };
+  }, [customNodes]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapPickTarget) return;
+    const canvas = map.getCanvas();
+    canvas.style.cursor = "crosshair";
+    const handleMapPick = (event: any) => {
+      const coord: Coord = [Number(event.lngLat.lng.toFixed(7)), Number(event.lngLat.lat.toFixed(7))];
+      let label = mapPickTarget.kind === "stop" ? "中途停站" : "途经点";
+      setCustomNodes((current) => current.map((node, index) => {
+        if (node.id !== mapPickTarget.nodeId) return node;
+        label = node.kind === "stop" ? "中途停站" : "途经点";
+        return { ...node, value: node.value.trim() || `地图${label} ${String(index + 1).padStart(2, "0")}`, coord };
+      }));
+      setMapPickTarget(null);
+      setNotice(`${label}已从地图选定；可填写名称，坐标会继续保留`);
+    };
+    map.once("click", handleMapPick);
+    return () => {
+      map.off("click", handleMapPick);
+      canvas.style.cursor = "";
+    };
+  }, [mapPickTarget]);
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !stopEditing || !showStops || !map.getLayer("stops-hit")) return;
@@ -1091,11 +1181,32 @@ export default function Home() {
     setCustomNodes((current) => current.map((node) => node.id === id ? { ...node, ...patch } : node));
   }
 
+  function beginCustomNodeMapPick(node: CustomNode) {
+    setCropMode(false);
+    setStopEditing(false);
+    setMapPickTarget({ nodeId: node.id, kind: node.kind });
+    setNotice(`请在地图上点击${node.kind === "stop" ? "中途停站" : "途经点"}的位置`);
+  }
+
+  function clearCustomNodeMapPoint(node: CustomNode) {
+    updateCustomNode(node.id, { coord: undefined });
+    if (mapPickTarget?.nodeId === node.id) setMapPickTarget(null);
+    setNotice("已改回文字定位；规划时会按输入的名称搜索");
+  }
+
+  function removeCustomNode(id: string) {
+    setCustomNodes((current) => current.filter((item) => item.id !== id));
+    if (mapPickTarget?.nodeId === id) setMapPickTarget(null);
+  }
+
   async function submitCustomRoute(event: FormEvent) {
     event.preventDefault();
     const start = customStart.trim();
     const end = customEnd.trim();
-    const nodes = customNodes.map((node) => ({ ...node, value: node.value.trim() }));
+    const nodes = customNodes.map((node, index) => ({
+      ...node,
+      value: node.value.trim() || (node.coord ? `地图${node.kind === "stop" ? "中途停站" : "途经点"} ${String(index + 1).padStart(2, "0")}` : ""),
+    }));
     if (!start || !end || nodes.some((node) => !node.value)) {
       setNotice("请填写首站、末站以及每一个中途节点");
       return;
@@ -1120,25 +1231,31 @@ export default function Home() {
       custom: true,
     };
     setPlanningCustom(true);
+    setCustomPlanFailure(null);
+    setMapPickTarget(null);
     setRoutes((current) => [...current, pending]);
     setNotice(`正在为 ${routeName} 按“${drivingOption.label}”规划路径…`);
 
     try {
-      const AMap = await loadAmap();
+      const AMap = await withCustomRouteTimeout(loadAmap(), 15000, "高德服务加载");
       const geocoder = new AMap.Geocoder({ city, extensions: "base" });
-      const ordered = [
-        { kind: "stop" as const, value: start },
+      const ordered: { kind: CustomNode["kind"]; value: string; coord?: Coord }[] = [
+        { kind: "stop", value: start },
         ...nodes,
-        { kind: "stop" as const, value: end },
+        { kind: "stop", value: end },
       ];
       const geocoded: { kind: CustomNode["kind"]; name: string; gcj: Coord; coord: Coord }[] = [];
 
       for (const node of ordered) {
-        const result: any = await new Promise((resolve, reject) => {
+        if (node.coord) {
+          geocoded.push({ kind: node.kind, name: node.value, gcj: wgsToGcj(node.coord), coord: node.coord });
+          continue;
+        }
+        const result: any = await withCustomRouteTimeout(new Promise((resolve, reject) => {
           geocoder.getLocation(node.value, (status: string, data: any) => status === "complete" && data?.info === "OK"
             ? resolve(data)
             : reject(new Error(`无法定位“${node.value}”`)));
-        });
+        }), 15000, `定位“${node.value}”`);
         const gcj = readGcjLngLat(result?.geocodes?.[0]?.location);
         if (!gcj) throw new Error(`“${node.value}”没有返回有效坐标`);
         geocoded.push({ kind: node.kind, name: node.value, gcj, coord: gcjToWgs(gcj) });
@@ -1148,7 +1265,7 @@ export default function Home() {
       for (let index = 0; index < geocoded.length - 1; index += 1) {
         const origin = geocoded[index];
         const destination = geocoded[index + 1];
-        const result: any = await new Promise((resolve, reject) => {
+        const result: any = await withCustomRouteTimeout(new Promise((resolve, reject) => {
           const driving = new AMap.Driving({ city, policy: drivingOption.policy, extensions: "all" });
           driving.search(
             new AMap.LngLat(origin.gcj[0], origin.gcj[1]),
@@ -1157,7 +1274,7 @@ export default function Home() {
               ? resolve(data)
               : reject(new Error(`${origin.name} → ${destination.name} 规划失败：${data?.info || status}`)),
           );
-        });
+        }), 30000, `${origin.name} → ${destination.name} 路径规划`);
         const route = result?.routes?.[0];
         const rawLeg = (route?.steps ?? []).flatMap((step: any) => step?.path ?? []);
         const leg = (rawLeg.length ? rawLeg : route?.path ?? []).map(readLngLat).filter(Boolean) as Coord[];
@@ -1174,16 +1291,19 @@ export default function Home() {
       setCustomStart("");
       setCustomEnd("");
       setCustomNodes([]);
+      setCustomPlanFailure(null);
       setNotice(`${routeName} 已按“${drivingOption.label}”加入画布`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "自定义线路规划失败";
-      setRoutes((current) => current.map((route) => route.id === id ? { ...route, status: "error", error: message } : route));
-      setNotice(message);
+      const timedOut = error instanceof CustomRouteTimeoutError;
+      if (timedOut && message.startsWith("高德服务加载")) amapPromise = null;
+      setRoutes((current) => current.filter((route) => route.id !== id));
+      setCustomPlanFailure({ message, timedOut });
+      setNotice(`${timedOut ? "规划请求超时" : "自定义线路生成失败"}：输入内容已全部保留，可直接重新生成`);
     } finally {
       setPlanningCustom(false);
     }
   }
-
   function updateRoute(id: string, patch: Partial<TransitRoute>) {
     setRoutes((current) => current.map((route) => route.id === id ? { ...route, ...patch } : route));
   }
@@ -1484,8 +1604,10 @@ export default function Home() {
                     <option value="stop">中途停站</option>
                     <option value="via">途经点</option>
                   </select>
-                  <input value={node.value} onChange={(event) => updateCustomNode(node.id, { value: event.target.value })} placeholder={node.kind === "stop" ? "显示站点标记" : "只约束路径"} aria-label={`第 ${index + 1} 个节点名称`} />
-                  <button type="button" onClick={() => setCustomNodes((current) => current.filter((item) => item.id !== node.id))} aria-label={`删除第 ${index + 1} 个节点`}>×</button>
+                  <input value={node.value} onChange={(event) => updateCustomNode(node.id, { value: event.target.value })} placeholder={node.kind === "stop" ? "输入站名，或在地图选点" : "输入地点，或在地图选点"} aria-label={`第 ${index + 1} 个节点名称`} />
+                  <button type="button" className={`node-map-pick ${node.coord ? "selected" : ""}`} onClick={() => beginCustomNodeMapPick(node)} aria-label={`在地图上选择第 ${index + 1} 个节点`} title={node.coord ? "重新选择地图位置" : "在地图上选点"}>{mapPickTarget?.nodeId === node.id ? "点击地图" : node.coord ? "重选" : "选点"}</button>
+                  <button type="button" className="node-remove" onClick={() => removeCustomNode(node.id)} aria-label={`删除第 ${index + 1} 个节点`}>×</button>
+                  {node.coord && <span className="picked-coordinate">已选地图位置 · {node.coord[0].toFixed(5)}, {node.coord[1].toFixed(5)} <button type="button" onClick={() => clearCustomNodeMapPoint(node)}>改用文字定位</button></span>}
                 </div>)}
               </div>}
 
@@ -1493,8 +1615,12 @@ export default function Home() {
                 <button type="button" onClick={() => addCustomNode("stop")}><span>＋</span> 中途停站</button>
                 <button type="button" onClick={() => addCustomNode("via")}><span>＋</span> 途经点</button>
               </div>
-              <p className="builder-note">节点按列表顺序经过；中途停站显示站标，途经点只控制走向。</p>
-              <button className="primary" type="submit" disabled={planningCustom || !customStart.trim() || !customEnd.trim()}><span>⌁</span>{planningCustom ? "正在规划高德导航…" : "规划并加入画布"}</button>
+              <p className="builder-note">节点按列表顺序经过；中途停站显示站标，途经点只控制走向。地图选点会直接使用所选坐标。</p>
+              {customPlanFailure && <div className={`custom-retry ${customPlanFailure.timedOut ? "timeout" : ""}`} role="alert">
+                <div><strong>{customPlanFailure.timedOut ? "高德规划响应超时" : "本次生成未完成"}</strong><p>{customPlanFailure.message}。首末站、中途节点和规划偏好均已保留。</p></div>
+                <button type="submit" disabled={planningCustom}>使用保留内容重新生成</button>
+              </div>}
+              <button className="primary" type="submit" disabled={planningCustom || !customStart.trim() || !customEnd.trim()}><span>⌁</span>{planningCustom ? "正在规划高德导航…" : customPlanFailure ? "重新生成自定义线路" : "规划并加入画布"}</button>
             </form>}
 
             <div className="route-stack">
@@ -1621,6 +1747,10 @@ export default function Home() {
           <div className="location-chip"><span>制图城市</span><strong>{city || "未指定"}</strong></div>
           <div className="map-actions"><button onClick={() => fitRoutes(routes)} disabled={!readyRoutes.length}>适配线路</button><button onClick={() => setPanel("layers")}>{BASES[base].name}</button><button onClick={() => setLabels(!labels)} className={labels ? "active" : ""}>标注</button></div>
         </div>
+        {mapPickTarget && <div className="map-pick-banner" role="status">
+          <div><strong>在地图上选择{mapPickTarget.kind === "stop" ? "中途停站" : "途经点"}</strong><span>单击目标位置；选中后仍可修改显示名称</span></div>
+          <button type="button" onClick={() => { setMapPickTarget(null); setNotice("已取消地图选点"); }}>取消</button>
+        </div>}
         {visibleReadyRoutes.length > 0 && <div className="legend" style={{ left: `${legendPosition.x * 100}%`, top: `${legendPosition.y * 100}%` }} onPointerDown={startLegendDrag} onPointerMove={moveLegendDrag} onPointerUp={endLegendDrag} onPointerCancel={endLegendDrag} role="group" aria-label="可拖动线路图例">
           <p>BUS ROUTES · {String(visibleReadyRoutes.length).padStart(2, "0")}<b>拖动</b></p>
           {visibleReadyRoutes.map((route) => <div key={route.id}><i className={`line-style-preview ${getLineStyleKey(route)}`} style={{ color: route.color }} /><span>{route.name}</span></div>)}
