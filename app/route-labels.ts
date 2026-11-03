@@ -3,6 +3,7 @@ export type RouteAnnotationMode = "legend" | "labels";
 export type RouteLabelTextMode = "code" | "digits" | "full";
 export type LabelRoute = { id: string; name: string; color: string; path: LabelCoord[]; labelPosition?: LabelCoord; labelText?: string };
 type Point = { x: number; y: number };
+let labelMeasureContext: CanvasRenderingContext2D | null = null;
 
 export function routeLabelText(route: Pick<LabelRoute, "name" | "labelText">, mode: RouteLabelTextMode = "code") {
   if (route.labelText?.trim()) return route.labelText.trim();
@@ -41,11 +42,32 @@ export function routeLabelPosition(route: LabelRoute, fraction = 0.5): LabelCoor
   return route.path[route.path.length - 1];
 }
 
-export function routeLabelMetrics(name: string) {
-  const characters = Array.from(name);
-  const text = characters.length > 18 ? `${characters.slice(0, 17).join("")}…` : name;
-  const textWidth = Array.from(text).reduce((width, character) => width + (/[^\x00-\xff]/.test(character) ? 12 : 7.5), 0);
-  return { text, width: Math.max(48, Math.min(240, Math.ceil(textWidth + 24))), height: 30 };
+export function closestRouteLabelPosition(route: LabelRoute, position: LabelCoord): LabelCoord | null {
+  if (!route.path.length) return null;
+  const longitudeScale = Math.cos(position[1] * Math.PI / 180);
+  let closest = route.path[0], closestDistance = Infinity;
+  route.path.forEach((end, index) => {
+    const start = route.path[Math.max(0, index - 1)];
+    const dx = (end[0] - start[0]) * longitudeScale, dy = end[1] - start[1];
+    const lengthSquared = dx * dx + dy * dy;
+    const t = lengthSquared ? Math.max(0, Math.min(1, ((position[0] - start[0]) * longitudeScale * dx + (position[1] - start[1]) * dy) / lengthSquared)) : 0;
+    const point: LabelCoord = [start[0] + (end[0] - start[0]) * t, start[1] + (end[1] - start[1]) * t];
+    const distance = Math.hypot((point[0] - position[0]) * longitudeScale, point[1] - position[1]);
+    if (distance < closestDistance) { closest = point; closestDistance = distance; }
+  });
+  return closest;
+}
+
+export function routeLabelMetrics(text: string, measureText?: (text: string) => number) {
+  if (!measureText && typeof document !== "undefined") {
+    labelMeasureContext ??= document.createElement("canvas").getContext("2d");
+    if (labelMeasureContext) {
+      labelMeasureContext.font = '700 12px "Microsoft YaHei", sans-serif';
+      measureText = (value) => labelMeasureContext!.measureText(value).width;
+    }
+  }
+  const textWidth = measureText ? measureText(text) : Array.from(text).reduce((width, character) => width + (/[^\x00-\xff]/.test(character) ? 12 : 7.5), 0);
+  return { text, width: Math.max(48, Math.ceil(textWidth + 24)), height: 30 };
 }
 
 function escapeXml(value: string) {
@@ -61,7 +83,7 @@ export function drawCanvasRouteLabels(context: CanvasRenderingContext2D, routes:
     const coord = routeLabelPosition(route);
     if (!coord) return;
     const point = project(coord);
-    const metrics = routeLabelMetrics(routeLabelText(route, textMode));
+    const metrics = routeLabelMetrics(routeLabelText(route, textMode), (text) => context.measureText(text).width / scale);
     const width = metrics.width * scale, height = metrics.height * scale;
     context.beginPath();
     context.roundRect(point.x - width / 2, point.y - height / 2, width, height, 6 * scale);
@@ -71,7 +93,7 @@ export function drawCanvasRouteLabels(context: CanvasRenderingContext2D, routes:
     context.lineWidth = 2 * scale;
     context.stroke();
     context.fillStyle = route.color;
-    context.fillText(metrics.text, point.x, point.y + scale, width - 20 * scale);
+    context.fillText(metrics.text, point.x, point.y + scale);
   });
   context.restore();
 }

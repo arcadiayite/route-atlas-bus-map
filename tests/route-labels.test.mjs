@@ -1,22 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { drawCanvasRouteLabels, isLabelCoord, makeSvgRouteLabels, routeLabelPosition, routeLabelMetrics, routeLabelText } from "../app/route-labels.ts";
+import { closestRouteLabelPosition, drawCanvasRouteLabels, isLabelCoord, makeSvgRouteLabels, routeLabelPosition, routeLabelMetrics, routeLabelText } from "../app/route-labels.ts";
 import { whenMapStyleReady } from "../app/map-ready.ts";
 import { EventEmitter } from "node:events";
 
 const route = { id: "test", name: "K2", color: "#008e88", path: [[110, 20], [110.1, 20], [112, 20]] };
 
-test("route updates resume after source loading even without another style.load", () => {
-  const map = Object.assign(new EventEmitter(), { isStyleLoaded: () => false });
+test("route updates do not wait for remote basemap tiles after the style is ready", () => {
+  const map = Object.assign(new EventEmitter(), { getStyle: () => ({ version: 8, sources: {}, layers: [] }), isStyleLoaded: () => false });
   let updates = 0;
   whenMapStyleReady(map, () => updates++);
+  assert.equal(updates, 1);
   map.emit("idle");
   map.emit("style.load");
   assert.equal(updates, 1);
 });
 
 test("superseded route updates are cancelled while waiting for map readiness", () => {
-  const map = Object.assign(new EventEmitter(), { isStyleLoaded: () => false });
+  const map = Object.assign(new EventEmitter(), { getStyle: () => undefined });
   let updates = 0;
   const cancel = whenMapStyleReady(map, () => updates++);
   cancel();
@@ -49,11 +50,20 @@ test("SVG projects saved position in export coordinates, scales labels, and esca
   assert.doesNotMatch(svg, /id="legend"/);
 });
 
-test("long route names remain bounded without splitting Unicode characters", () => {
-  const metrics = routeLabelMetrics("公交🚌".repeat(12));
-  assert.ok(metrics.width <= 240);
-  assert.ok(metrics.text.endsWith("…"));
-  assert.equal(Array.from(metrics.text).length, 18);
+test("long labels keep all text and expand to measured font width", () => {
+  const text = "公交🚌".repeat(12);
+  const metrics = routeLabelMetrics(text, () => 520.4);
+  assert.equal(metrics.text, text);
+  assert.equal(metrics.width, 545);
+  assert.ok(routeLabelMetrics(text).width > 240);
+});
+
+test("moving a label back snaps to the nearest route segment rather than a distant default", () => {
+  const line = { ...route, path: [[110, 20], [112, 20], [112, 22]] };
+  assert.deepEqual(closestRouteLabelPosition(line, [110.5, 20.2]), [110.5, 20]);
+  assert.deepEqual(closestRouteLabelPosition(line, [112.2, 21.5]), [112, 21.5]);
+  assert.deepEqual(closestRouteLabelPosition(line, [109, 19]), [110, 20]);
+  assert.equal(closestRouteLabelPosition({ ...line, path: [] }, [110, 20]), null);
 });
 
 test("label modes distinguish line codes, digits and full names without including endpoint numbers", () => {
@@ -81,7 +91,7 @@ test("custom text survives archive JSON, overrides all modes and can return to a
 
 test("PNG and SVG both use the selected text mode and safely render custom text", () => {
   const texts = [];
-  const context = { save() {}, restore() {}, beginPath() {}, roundRect() {}, fill() {}, stroke() {}, fillText(text) { texts.push(text); } };
+  const context = { save() {}, restore() {}, beginPath() {}, roundRect() {}, fill() {}, stroke() {}, measureText(text) { return { width: text.length * 14 }; }, fillText(text) { texts.push(text); } };
   const routes = [{ ...route, name: "10A路(首站--末站)" }, { ...route, id: "custom", labelText: '<快线 & "东">' }];
   const project = () => ({ x: 100, y: 100 });
   drawCanvasRouteLabels(context, routes, project, 2, "digits");

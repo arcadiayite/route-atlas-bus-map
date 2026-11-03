@@ -3,7 +3,7 @@
 import { FormEvent, PointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as maplibregl from "maplibre-gl";
 import type { Map as MapLibreMap, StyleSpecification } from "maplibre-gl";
-import { drawCanvasRouteLabels, isLabelCoord, makeSvgRouteLabels, routeLabelMetrics, routeLabelPosition, routeLabelText } from "./route-labels";
+import { closestRouteLabelPosition, drawCanvasRouteLabels, isLabelCoord, makeSvgRouteLabels, routeLabelMetrics, routeLabelPosition, routeLabelText } from "./route-labels";
 import type { RouteAnnotationMode, RouteLabelTextMode } from "./route-labels";
 import { whenMapStyleReady } from "./map-ready";
 
@@ -1076,7 +1076,7 @@ export default function Home() {
       const existing = labelMarkers.current.get(route.id);
       const element = (existing?.getElement() ?? document.createElement("button")) as HTMLButtonElement;
       element.type = "button";
-      element.className = "route-map-label";
+      element.classList.add("route-map-label");
       const text = routeLabelText(route, labelTextMode);
       const metrics = routeLabelMetrics(text);
       element.textContent = metrics.text;
@@ -1459,8 +1459,12 @@ export default function Home() {
   }
 
   function resetRouteLabel(id: string) {
-    setRoutes((current) => current.map((route, index) => route.id === id ? { ...route, labelPosition: routeLabelPosition({ ...route, labelPosition: undefined }, 0.35 + (index % 4) * 0.1) ?? undefined } : route));
-    setNotice("标签已移回线路上");
+    setRoutes((current) => current.map((route) => {
+      if (route.id !== id) return route;
+      const position = routeLabelPosition(route);
+      return { ...route, labelPosition: position ? closestRouteLabelPosition(route, position) ?? undefined : undefined };
+    }));
+    setNotice("标签已吸附到最近的线路位置");
   }
 
   function startLegendDrag(event: PointerEvent<HTMLDivElement>) {

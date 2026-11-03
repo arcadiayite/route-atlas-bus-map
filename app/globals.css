@@ -230,7 +230,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .route-label-editor > div button:disabled { opacity: .45; cursor: default; }
 .route-label-editor .reset-route-label { margin: 9px 0 0 auto; padding: 0; }
 .reset-route-label { display: block; margin: 0 10px 10px auto; border: 0; background: transparent; color: var(--teal); font-size: 10px; cursor: pointer; }
-.route-map-label { z-index: 2; height: 30px; padding: 0 10px; overflow: hidden; border: 2px solid currentColor; border-radius: 6px; background: #fff; box-shadow: 0 2px 7px rgba(20,35,40,.16); font: 700 12px/26px "Microsoft YaHei", sans-serif; text-align: center; white-space: nowrap; text-overflow: ellipsis; cursor: grab; touch-action: none; user-select: none; }
+.route-map-label { position: absolute; top: 0; left: 0; z-index: 2; height: 30px; max-width: none; padding: 0 10px; border: 2px solid currentColor; border-radius: 6px; background: #fff; box-shadow: 0 2px 7px rgba(20,35,40,.16); font: 700 12px/26px "Microsoft YaHei", sans-serif; text-align: center; white-space: nowrap; cursor: grab; touch-action: none; user-select: none; }
 .route-map-label:hover,.route-map-label:focus-visible { z-index: 3; box-shadow: 0 0 0 3px rgba(255,255,255,.85), 0 3px 12px rgba(20,35,40,.25); outline: 2px solid currentColor; outline-offset: 2px; }
 .route-map-label.dragging { cursor: grabbing; }
 .format-options { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 14px; }
