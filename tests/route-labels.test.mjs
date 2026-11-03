@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isLabelCoord, makeSvgRouteLabels, routeLabelPosition, routeLabelMetrics } from "../app/route-labels.ts";
+import { drawCanvasRouteLabels, isLabelCoord, makeSvgRouteLabels, routeLabelPosition, routeLabelMetrics, routeLabelText } from "../app/route-labels.ts";
 import { whenMapStyleReady } from "../app/map-ready.ts";
 import { EventEmitter } from "node:events";
 
@@ -38,7 +38,7 @@ test("dragged geographic position survives archive JSON and takes priority over 
 });
 
 test("SVG projects saved position in export coordinates, scales labels, and escapes user names", () => {
-  const svg = makeSvgRouteLabels([{ ...route, id: 'a"b', name: '<K2 & "支线">', labelPosition: [113, 22] }], ([lng, lat]) => ({ x: lng - 100, y: lat - 10 }), 2);
+  const svg = makeSvgRouteLabels([{ ...route, id: 'a"b', name: '<K2 & "支线">', labelPosition: [113, 22] }], ([lng, lat]) => ({ x: lng - 100, y: lat - 10 }), 2, "full");
   assert.match(svg, /id="route-labels"/);
   assert.match(svg, /data-route-id="a&quot;b"/);
   assert.match(svg, /&lt;K2 &amp; &quot;支线&quot;&gt;/);
@@ -54,4 +54,40 @@ test("long route names remain bounded without splitting Unicode characters", () 
   assert.ok(metrics.width <= 240);
   assert.ok(metrics.text.endsWith("…"));
   assert.equal(Array.from(metrics.text).length, 18);
+});
+
+test("label modes distinguish line codes, digits and full names without including endpoint numbers", () => {
+  for (const [name, code, digits] of [
+    ["K2路(前山总站--金鼎总站)", "K2", "2"],
+    ["10A路（1号口岸--2号站）", "10A", "10"],
+    ["公交 Ｋ２ 路", "K2", "2"],
+    ["2-1路(首站--末站)", "2-1", "2-1"],
+    ["环城观光线(1号门--2号门)", "环城观光线", "环城观光线"],
+  ]) {
+    assert.equal(routeLabelText({ name }, "code"), code);
+    assert.equal(routeLabelText({ name }, "digits"), digits);
+    assert.equal(routeLabelText({ name }, "full"), name);
+  }
+});
+
+test("custom text survives archive JSON, overrides all modes and can return to automatic text", () => {
+  const original = { ...route, name: "K2路(首站--末站)", labelText: "  机场快线  ", labelPosition: [113, 22] };
+  const restored = JSON.parse(JSON.stringify(original));
+  for (const mode of ["code", "digits", "full"]) assert.equal(routeLabelText(restored, mode), "机场快线");
+  assert.equal(routeLabelText({ ...restored, labelText: "" }, "digits"), "2");
+  assert.deepEqual(restored.labelPosition, original.labelPosition);
+  assert.equal(restored.name, original.name);
+});
+
+test("PNG and SVG both use the selected text mode and safely render custom text", () => {
+  const texts = [];
+  const context = { save() {}, restore() {}, beginPath() {}, roundRect() {}, fill() {}, stroke() {}, fillText(text) { texts.push(text); } };
+  const routes = [{ ...route, name: "10A路(首站--末站)" }, { ...route, id: "custom", labelText: '<快线 & "东">' }];
+  const project = () => ({ x: 100, y: 100 });
+  drawCanvasRouteLabels(context, routes, project, 2, "digits");
+  assert.deepEqual(texts, ["10", '<快线 & "东">']);
+  const svg = makeSvgRouteLabels(routes, project, 2, "digits");
+  assert.match(svg, />10<\/text>/);
+  assert.match(svg, /&lt;快线 &amp; &quot;东&quot;&gt;<\/text>/);
+  assert.doesNotMatch(svg, /<快线/);
 });

@@ -3,8 +3,8 @@
 import { FormEvent, PointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as maplibregl from "maplibre-gl";
 import type { Map as MapLibreMap, StyleSpecification } from "maplibre-gl";
-import { drawCanvasRouteLabels, isLabelCoord, makeSvgRouteLabels, routeLabelMetrics, routeLabelPosition } from "./route-labels";
-import type { RouteAnnotationMode } from "./route-labels";
+import { drawCanvasRouteLabels, isLabelCoord, makeSvgRouteLabels, routeLabelMetrics, routeLabelPosition, routeLabelText } from "./route-labels";
+import type { RouteAnnotationMode, RouteLabelTextMode } from "./route-labels";
 import { whenMapStyleReady } from "./map-ready";
 
 type Coord = [number, number];
@@ -27,6 +27,7 @@ type TransitRoute = {
   dash: boolean;
   lineStyle?: LineStyleKey;
   labelPosition?: Coord;
+  labelText?: string;
   visible: boolean;
   path: Coord[];
   stops: { name: string; coord: Coord }[];
@@ -56,6 +57,7 @@ type ArchivePayload = {
   drivingPreference?: DrivingPreference;
   exportLegend?: boolean;
   annotationMode?: RouteAnnotationMode;
+  labelTextMode?: RouteLabelTextMode;
   legendPosition?: NormalizedPoint;
   camera: MapCamera;
 };
@@ -726,14 +728,19 @@ function addRouteLayers(
   }
 }
 
-function AnnotationSelector({ mode, onChange }: { mode: RouteAnnotationMode; onChange: (mode: RouteAnnotationMode) => void }) {
+function AnnotationSelector({ mode, onChange, textMode, onTextModeChange }: { mode: RouteAnnotationMode; onChange: (mode: RouteAnnotationMode) => void; textMode: RouteLabelTextMode; onTextModeChange: (mode: RouteLabelTextMode) => void }) {
   return <div className="annotation-setting">
     <strong>线路识别方式</strong>
     <div className="annotation-options" role="group" aria-label="线路识别方式">
       <button type="button" aria-pressed={mode === "legend"} onClick={() => onChange("legend")}><i className="annotation-legend-icon">☰</i><span><b>图例</b><small>集中展示线路</small></span></button>
       <button type="button" aria-pressed={mode === "labels"} onClick={() => onChange("labels")}><i className="annotation-label-icon">K2</i><span><b>线路标签</b><small>在线路上标注</small></span></button>
     </div>
-    <p>{mode === "labels" ? "每条可见线路一个同色标签，可直接拖动；位置随存档保存。" : "在地图上拖动图例，可调整摆放位置。"}</p>
+    {mode === "labels" && <label className="label-text-mode">标签内容<select aria-label="线路标签显示内容" value={textMode} onChange={(event) => onTextModeChange(event.target.value as RouteLabelTextMode)}>
+      <option value="code">仅线路号 · K2 / 10A</option>
+      <option value="digits">仅数字 · 2 / 10</option>
+      <option value="full">完整名称 · 含首末站</option>
+    </select></label>}
+    <p>{mode === "labels" ? "拖动调整位置，双击编辑文字；自定义文字优先，清空后按上方规则显示。" : "在地图上拖动图例，可调整摆放位置。"}</p>
   </div>;
 }
 
@@ -771,6 +778,7 @@ export default function Home() {
   const [exportFormat, setExportFormat] = useState<ExportFormat>("png");
   const [exportLegend, setExportLegend] = useState(true);
   const [annotationMode, setAnnotationMode] = useState<RouteAnnotationMode>("legend");
+  const [labelTextMode, setLabelTextMode] = useState<RouteLabelTextMode>("code");
   const [legendPosition, setLegendPosition] = useState<NormalizedPoint>({ x: 0.02, y: 0.78 });
   const [notice, setNotice] = useState("输入一条或多条线路开始制图");
   const [exporting, setExporting] = useState(false);
@@ -783,6 +791,7 @@ export default function Home() {
   const [autoSaveStatus, setAutoSaveStatus] = useState("正在读取存档…");
   const [editingRouteId, setEditingRouteId] = useState<string | null>(null);
   const [routeNameDraft, setRouteNameDraft] = useState("");
+  const [editingLabelId, setEditingLabelId] = useState<string | null>(null);
   const latestRoutesRef = useRef(routes);
   const latestLineWidthRef = useRef(lineWidth);
   const latestShowCasingRef = useRef(showCasing);
@@ -827,14 +836,15 @@ export default function Home() {
     drivingPreference,
     exportLegend,
     annotationMode,
+    labelTextMode,
     legendPosition,
     camera,
-  }), [city, routes, base, labels, showStops, showCasing, stopMode, stopEditing, hiddenStopIds, maskOpacity, lineWidth, drivingPreference, exportLegend, annotationMode, legendPosition, camera]);
+  }), [city, routes, base, labels, showStops, showCasing, stopMode, stopEditing, hiddenStopIds, maskOpacity, lineWidth, drivingPreference, exportLegend, annotationMode, labelTextMode, legendPosition, camera]);
 
   const applyArchivePayload = useCallback((payload: ArchivePayload) => {
     if (!payload || payload.version !== 1 || !Array.isArray(payload.routes)) throw new Error("存档格式不受支持");
     setCity(payload.city || "珠海市");
-    setRoutes(payload.routes.map((route) => ({ ...route, labelPosition: isLabelCoord(route.labelPosition) ? route.labelPosition : undefined, lineStyle: getLineStyleKey(route), status: "ready" })));
+    setRoutes(payload.routes.map((route) => ({ ...route, labelText: typeof route.labelText === "string" ? route.labelText.slice(0, 60) : undefined, labelPosition: isLabelCoord(route.labelPosition) ? route.labelPosition : undefined, lineStyle: getLineStyleKey(route), status: "ready" })));
     if (payload.base && BASES[payload.base]) setBase(payload.base);
     setLabels(Boolean(payload.labels));
     setShowStops(Boolean(payload.showStops));
@@ -847,6 +857,7 @@ export default function Home() {
     if (payload.drivingPreference && DRIVING_PREFERENCES.some((item) => item.value === payload.drivingPreference)) setDrivingPreference(payload.drivingPreference);
     setExportLegend(payload.exportLegend !== false);
     setAnnotationMode(payload.annotationMode === "labels" ? "labels" : "legend");
+    setLabelTextMode(payload.labelTextMode === "digits" || payload.labelTextMode === "full" ? payload.labelTextMode : "code");
     if (payload.legendPosition && Number.isFinite(payload.legendPosition.x) && Number.isFinite(payload.legendPosition.y)) setLegendPosition(payload.legendPosition);
     setCrop(null);
     if (payload.camera) {
@@ -1066,12 +1077,14 @@ export default function Home() {
       const element = (existing?.getElement() ?? document.createElement("button")) as HTMLButtonElement;
       element.type = "button";
       element.className = "route-map-label";
-      element.textContent = routeLabelMetrics(route.name).text;
+      const text = routeLabelText(route, labelTextMode);
+      const metrics = routeLabelMetrics(text);
+      element.textContent = metrics.text;
       element.style.color = route.color;
-      element.style.width = `${routeLabelMetrics(route.name).width}px`;
+      element.style.width = `${metrics.width}px`;
       element.dataset.routeId = route.id;
-      element.setAttribute("aria-label", `${route.name} 线路标签，可拖动或使用方向键移动`);
-      element.title = `${route.name} · 拖动调整位置，方向键微调`;
+      element.setAttribute("aria-label", `${text} 线路标签，可拖动或使用方向键移动，双击编辑`);
+      element.title = `${route.name} · 标签：${text} · 拖动调整位置，双击编辑文字`;
       if (existing) { existing.setLngLat(coord); return; }
       const marker = new maplibregl.Marker({ element, draggable: true, anchor: "center" }).setLngLat(coord).addTo(map);
       labelMarkers.current.set(route.id, marker);
@@ -1086,6 +1099,12 @@ export default function Home() {
         setNotice(`${element.textContent} 标签位置已更新，存档与导出会保留此位置`);
       });
       element.addEventListener("click", (event) => event.stopPropagation());
+      element.addEventListener("dblclick", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        setPanel("layers");
+        setEditingLabelId(route.id);
+      });
       element.addEventListener("keydown", (event) => {
         const directions: Record<string, [number, number]> = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
         const direction = directions[event.key];
@@ -1098,7 +1117,15 @@ export default function Home() {
         savePosition();
       });
     });
-  }, [visibleReadyRoutes, annotationMode]);
+  }, [visibleReadyRoutes, annotationMode, labelTextMode]);
+
+  useEffect(() => {
+    if (panel !== "layers" || !editingLabelId) return;
+    const input = document.getElementById(`route-label-text-${editingLabelId}`) as HTMLInputElement | null;
+    input?.focus();
+    input?.select();
+    setEditingLabelId(null);
+  }, [panel, editingLabelId]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -1519,7 +1546,7 @@ export default function Home() {
         const context = outputCanvas.getContext("2d");
         if (!context) throw new Error("浏览器未能创建导出画布");
         context.drawImage(sourceCanvas, 0, 0, width, height);
-        if (annotationMode === "labels") drawCanvasRouteLabels(context, visibleReadyRoutes, (coord) => exportMap!.project(coord), width / area.width);
+        if (annotationMode === "labels") drawCanvasRouteLabels(context, visibleReadyRoutes, (coord) => exportMap!.project(coord), width / area.width, labelTextMode);
         else drawCanvasLegend(context, width, height, visibleReadyRoutes, legendPosition, width / area.width, showCasing);
       }
       const blob = await new Promise<Blob | null>((resolve) => outputCanvas.toBlob(resolve, "image/png"));
@@ -1599,7 +1626,7 @@ export default function Home() {
         return `<g id="station-${index + 1}" data-station-id="${escapeXml(stop.id)}" data-station-name="${escapeXml(stop.name)}"><title>${escapeXml(stop.name)}</title><circle cx="${point.x.toFixed(2)}" cy="${point.y.toFixed(2)}" r="${radius.toFixed(2)}" fill="#ffffff" stroke="${escapeXml(stroke)}" stroke-width="${(2 * renderScale).toFixed(2)}"/></g>`;
       }).join("") : "";
       const legendMarkup = !exportLegend ? "" : annotationMode === "labels"
-        ? makeSvgRouteLabels(activeRoutes, (coord) => exportMap!.project(coord), renderScale)
+        ? makeSvgRouteLabels(activeRoutes, (coord) => exportMap!.project(coord), renderScale, labelTextMode)
         : makeSvgLegend(width, height, activeRoutes, legendPosition, renderScale, showCasing);
       const casingFilter = showCasing ? `<filter id="route-casing" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB"><feMorphology in="SourceAlpha" operator="dilate" radius="${(1.5 * renderScale).toFixed(2)}" result="expanded"/><feFlood flood-color="#ffffff" flood-opacity=".92" result="white"/><feComposite in="white" in2="expanded" operator="in" result="casing"/><feMerge><feMergeNode in="casing"/><feMergeNode in="SourceGraphic"/></feMerge></filter>` : "";
       const hollowFilters = activeRoutes.map((route, routeIndex) => {
@@ -1735,7 +1762,7 @@ export default function Home() {
 
           {panel === "layers" && <section className="panel-section">
             <div className="section-heading"><div><p className="eyebrow">MAP STYLE</p><h2>选择地图风格</h2></div></div>
-            <AnnotationSelector mode={annotationMode} onChange={changeAnnotationMode} />
+            <AnnotationSelector mode={annotationMode} onChange={changeAnnotationMode} textMode={labelTextMode} onTextModeChange={setLabelTextMode} />
             {readyRoutes.length > 0 && <div className="route-layer-manager">
               <div className="layer-manager-heading"><div><strong>线路图层</strong><span>{visibleReadyRoutes.length}/{readyRoutes.length} 条显示中</span></div>{hiddenReadyRoutes.length > 0 && <button type="button" onClick={showAllRoutes}>全部显示</button>}</div>
               <div className="route-layer-list">
@@ -1752,7 +1779,12 @@ export default function Home() {
                       {LINE_STYLE_PRESETS.map((preset) => <option key={preset.value} value={preset.value}>{preset.label} · {preset.hint}</option>)}
                     </select>
                   </label>
-                  {annotationMode === "labels" && <button type="button" className="reset-route-label" onClick={() => resetRouteLabel(route.id)} aria-label={`重置 ${route.name} 的标签位置`}>标签移回线路</button>}
+                  {annotationMode === "labels" && <div className="route-label-editor">
+                    <label htmlFor={`route-label-text-${route.id}`}>标签文字</label>
+                    <div><input id={`route-label-text-${route.id}`} aria-label={`${route.name} 的标签文字`} value={route.labelText ?? ""} placeholder={routeLabelText({ ...route, labelText: undefined }, labelTextMode)} maxLength={60} onChange={(event) => updateRoute(route.id, { labelText: event.target.value })} />
+                    <button type="button" disabled={!route.labelText} onClick={() => updateRoute(route.id, { labelText: undefined })} aria-label={`恢复 ${route.name} 的自动标签`}>恢复自动</button></div>
+                    <button type="button" className="reset-route-label" onClick={() => resetRouteLabel(route.id)} aria-label={`重置 ${route.name} 的标签位置`}>标签移回线路</button>
+                  </div>}
                 </div>)}
               </div>
             </div>}
@@ -1780,7 +1812,7 @@ export default function Home() {
               <button className={exportFormat === "png" ? "active" : ""} onClick={() => setExportFormat("png")}><strong>PNG</strong><span>通用高清图片</span></button>
               <button className={exportFormat === "svg" ? "active" : ""} onClick={() => setExportFormat("svg")}><strong>SVG</strong><span>线路与站点可编辑</span></button>
             </div>
-            <AnnotationSelector mode={annotationMode} onChange={changeAnnotationMode} />
+            <AnnotationSelector mode={annotationMode} onChange={changeAnnotationMode} textMode={labelTextMode} onTextModeChange={setLabelTextMode} />
             <label className="export-legend-option"><div><strong>一同导出{annotationMode === "labels" ? "线路标签" : "图例"}</strong><span>{annotationMode === "labels" ? "保留标签在地图上的位置" : "图例可直接在地图上拖动定位"}</span></div><input type="checkbox" checked={exportLegend} onChange={(event) => setExportLegend(event.target.checked)} /><i /></label>
             <button className={`range-button ${crop ? "has-range" : ""}`} onClick={() => { setCropMode(true); setNotice("在地图上拖动框选导出范围"); }}>
               <span className="crop-icon" />

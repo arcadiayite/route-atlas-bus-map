@@ -1,7 +1,17 @@
 export type LabelCoord = [number, number];
 export type RouteAnnotationMode = "legend" | "labels";
-export type LabelRoute = { id: string; name: string; color: string; path: LabelCoord[]; labelPosition?: LabelCoord };
+export type RouteLabelTextMode = "code" | "digits" | "full";
+export type LabelRoute = { id: string; name: string; color: string; path: LabelCoord[]; labelPosition?: LabelCoord; labelText?: string };
 type Point = { x: number; y: number };
+
+export function routeLabelText(route: Pick<LabelRoute, "name" | "labelText">, mode: RouteLabelTextMode = "code") {
+  if (route.labelText?.trim()) return route.labelText.trim();
+  if (mode === "full") return route.name;
+  // Ignore the direction suffix, including station names that contain digits.
+  const name = route.name.split(/[（(]/)[0].trim().replace(/[０-９Ａ-Ｚａ-ｚ]/g, (character) => String.fromCharCode(character.charCodeAt(0) - 0xfee0));
+  const code = name.match(/[A-Za-z]*\s*\d+(?:[-－]\d+)?\s*[A-Za-z]*/)?.[0].replace(/\s/g, "") ?? name;
+  return mode === "digits" ? code.match(/\d+/g)?.join("-") ?? code : code;
+}
 
 export function isLabelCoord(value: unknown): value is LabelCoord {
   return Array.isArray(value) && value.length === 2 && value.every(Number.isFinite)
@@ -42,7 +52,7 @@ function escapeXml(value: string) {
   return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" })[character]!);
 }
 
-export function drawCanvasRouteLabels(context: CanvasRenderingContext2D, routes: LabelRoute[], project: (coord: LabelCoord) => Point, scale: number) {
+export function drawCanvasRouteLabels(context: CanvasRenderingContext2D, routes: LabelRoute[], project: (coord: LabelCoord) => Point, scale: number, textMode: RouteLabelTextMode = "code") {
   context.save();
   context.font = `700 ${12 * scale}px "Microsoft YaHei", sans-serif`;
   context.textAlign = "center";
@@ -51,7 +61,7 @@ export function drawCanvasRouteLabels(context: CanvasRenderingContext2D, routes:
     const coord = routeLabelPosition(route);
     if (!coord) return;
     const point = project(coord);
-    const metrics = routeLabelMetrics(route.name);
+    const metrics = routeLabelMetrics(routeLabelText(route, textMode));
     const width = metrics.width * scale, height = metrics.height * scale;
     context.beginPath();
     context.roundRect(point.x - width / 2, point.y - height / 2, width, height, 6 * scale);
@@ -66,12 +76,12 @@ export function drawCanvasRouteLabels(context: CanvasRenderingContext2D, routes:
   context.restore();
 }
 
-export function makeSvgRouteLabels(routes: LabelRoute[], project: (coord: LabelCoord) => Point, scale: number) {
+export function makeSvgRouteLabels(routes: LabelRoute[], project: (coord: LabelCoord) => Point, scale: number, textMode: RouteLabelTextMode = "code") {
   const labels = routes.map((route, index) => {
     const coord = routeLabelPosition(route);
     if (!coord) return "";
     const point = project(coord);
-    const metrics = routeLabelMetrics(route.name);
+    const metrics = routeLabelMetrics(routeLabelText(route, textMode));
     const width = metrics.width * scale, height = metrics.height * scale;
     return `<g id="route-label-${index + 1}" data-route-id="${escapeXml(route.id)}"><title>${escapeXml(route.name)}</title><rect x="${(point.x - width / 2).toFixed(2)}" y="${(point.y - height / 2).toFixed(2)}" width="${width.toFixed(2)}" height="${height.toFixed(2)}" rx="${6 * scale}" fill="#ffffff" stroke="${escapeXml(route.color)}" stroke-width="${2 * scale}"/><text x="${point.x.toFixed(2)}" y="${(point.y + scale).toFixed(2)}" text-anchor="middle" dominant-baseline="central" fill="${escapeXml(route.color)}" font-family="Microsoft YaHei, sans-serif" font-size="${12 * scale}" font-weight="700">${escapeXml(metrics.text)}</text></g>`;
   }).join("");
