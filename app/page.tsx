@@ -5,6 +5,7 @@ import * as maplibregl from "maplibre-gl";
 import type { Map as MapLibreMap, StyleSpecification } from "maplibre-gl";
 import { drawCanvasRouteLabels, isLabelCoord, makeSvgRouteLabels, routeLabelMetrics, routeLabelPosition } from "./route-labels";
 import type { RouteAnnotationMode } from "./route-labels";
+import { whenMapStyleReady } from "./map-ready";
 
 type Coord = [number, number];
 type BaseKey = "paper" | "atlas" | "dark" | "satellite";
@@ -1047,9 +1048,7 @@ export default function Home() {
       if (map.getLayer("place-labels")) map.setLayoutProperty("place-labels", "visibility", labels ? "visible" : "none");
       map.triggerRepaint();
     };
-    if (map.isStyleLoaded()) applyLabels();
-    else map.once("style.load", applyLabels);
-    return () => { map.off("style.load", applyLabels); };
+    return whenMapStyleReady(map, applyLabels);
   }, [labels]);
 
   useEffect(() => {
@@ -1107,9 +1106,7 @@ export default function Home() {
     const applyMask = () => {
       if (map.getLayer("map-mask")) map.setPaintProperty("map-mask", "fill-opacity", maskOpacity);
     };
-    if (map.isStyleLoaded()) applyMask();
-    else map.once("style.load", applyMask);
-    return () => { map.off("style.load", applyMask); };
+    return whenMapStyleReady(map, applyMask);
   }, [maskOpacity]);
 
   useEffect(() => {
@@ -1120,9 +1117,7 @@ export default function Home() {
       addRouteLayers(map, routes, lineWidth, showCasing, showStops, 1, stopMode, hiddenStopIds, stopEditing);
       map.triggerRepaint();
     };
-    if (map.isStyleLoaded()) renderRoutes();
-    else map.once("style.load", renderRoutes);
-    return () => { map.off("style.load", renderRoutes); };
+    return whenMapStyleReady(map, renderRoutes);
   }, [routes, lineWidth, showCasing, showStops, stopMode, hiddenStopIds, stopEditing]);
 
   useEffect(() => {
@@ -1132,9 +1127,7 @@ export default function Home() {
       addCustomDraftLayers(map, customNodes);
       map.triggerRepaint();
     };
-    if (map.isStyleLoaded()) renderDraftPoints();
-    else map.once("style.load", renderDraftPoints);
-    return () => { map.off("style.load", renderDraftPoints); };
+    return whenMapStyleReady(map, renderDraftPoints);
   }, [customNodes]);
 
   useEffect(() => {

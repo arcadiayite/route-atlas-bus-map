@@ -1,8 +1,28 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { isLabelCoord, makeSvgRouteLabels, routeLabelPosition, routeLabelMetrics } from "../app/route-labels.ts";
+import { whenMapStyleReady } from "../app/map-ready.ts";
+import { EventEmitter } from "node:events";
 
 const route = { id: "test", name: "K2", color: "#008e88", path: [[110, 20], [110.1, 20], [112, 20]] };
+
+test("route updates resume after source loading even without another style.load", () => {
+  const map = Object.assign(new EventEmitter(), { isStyleLoaded: () => false });
+  let updates = 0;
+  whenMapStyleReady(map, () => updates++);
+  map.emit("idle");
+  map.emit("style.load");
+  assert.equal(updates, 1);
+});
+
+test("superseded route updates are cancelled while waiting for map readiness", () => {
+  const map = Object.assign(new EventEmitter(), { isStyleLoaded: () => false });
+  let updates = 0;
+  const cancel = whenMapStyleReady(map, () => updates++);
+  cancel();
+  map.emit("idle");
+  assert.equal(updates, 0);
+});
 
 test("default label uses distance along the route, independent of vertex density", () => {
   assert.deepEqual(routeLabelPosition(route), [111, 20]);
