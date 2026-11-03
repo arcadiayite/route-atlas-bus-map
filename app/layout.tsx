@@ -26,8 +26,8 @@ export async function generateMetadata(): Promise<Metadata> {
 }
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
-  const amapKey = process.env.AMAP_WEB_KEY ?? process.env.NEXT_PUBLIC_AMAP_KEY ?? "";
-  const amapSecurityCode = process.env.AMAP_SECURITY_CODE ?? process.env.NEXT_PUBLIC_AMAP_SECURITY_CODE ?? "";
+  const amapKey = process.env.AMAP_WEB_KEY ?? "";
+  const amapSecurityCode = process.env.AMAP_SECURITY_CODE ?? "";
 
   return (
     <html lang="zh-CN">
